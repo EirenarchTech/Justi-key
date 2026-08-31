@@ -14,17 +14,29 @@ Built entirely on Python's standard library http.server. Implements:
 import hmac
 import json
 import re
-from datetime import datetime, timezone
+import sys
+import traceback
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import audit, config, crypto_utils, db, models, policy, templates
+from . import audit, config, crypto_utils, db, models, policy, templates, timeutil
 
 SESSION_COOKIE = config.SESSION_COOKIE_NAME
 PENDING_COOKIE = config.PENDING_COOKIE_NAME
 
 ROLES = ("requester", "approver", "auditor")
+
+# Field limits for sensor-supplied observation data.
+MAX_PLATE_LEN = 16
+MAX_FIELD_LEN = 128
+
+# A fixed hash used to spend the same PBKDF2 work on a login attempt for an
+# unknown username as for a known one. Without it, an unknown username
+# returns immediately while a known one costs a full PBKDF2 derivation,
+# which times the difference and turns the login form into a username oracle.
+_DUMMY_SALT = "00" * 16
+_DUMMY_HASH, _ = crypto_utils.hash_password("password-that-is-never-valid", _DUMMY_SALT)
 
 
 class HttpError(Exception):
@@ -68,6 +80,9 @@ def clear_cookie(name):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "JustiKey/0.1"
+    # Every response sets Content-Length (redirects included), so connections
+    # can safely be reused.
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
         pass
@@ -84,10 +99,20 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         self.query = parse_qs(parsed.query)
-        self.conn = db.get_connection()
         self.session_row = None
         self.pending_row = None
+        self.current_user = None
+        self._responded = False
+        self.body = b""
+        self.conn = None
         try:
+            # Read the body before routing. A handler that rejects a request
+            # early (an auth redirect, a role check) would otherwise leave the
+            # body unread in the socket and desynchronize the next request on
+            # a reused connection.
+            if method == "POST" and not self._read_body():
+                return
+            self.conn = db.get_connection()
             self.current_user = self._load_user()
             for m, regex, fn in ROUTES:
                 if m != method:
@@ -107,8 +132,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send_html(
                 404, templates.layout("Not Found", "", user=self.current_user, error="404 Not Found")
             )
+        except Exception:
+            # Log the detail server-side; show the client nothing but a
+            # generic message, so an unexpected fault cannot leak internals.
+            traceback.print_exc(file=sys.stderr)
+            if not self._responded:
+                self._send_html(500, templates.layout(
+                    "Server error", "", user=None,
+                    error="Internal server error. The incident has been logged."))
         finally:
-            self.conn.close()
+            if self.conn is not None:
+                self.conn.close()
 
     # -- request helpers ------------------------------------------------
 
@@ -145,21 +179,34 @@ class Handler(BaseHTTPRequestHandler):
         return pending
 
     def _read_body(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        if length <= 0:
-            return b""
-        return self.rfile.read(length)
+        """Read the request body once, enforcing a size cap.
+
+        Returns False (having already responded) if the request should not
+        proceed.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            length = -1
+        if length < 0:
+            self.close_connection = True
+            self._send_json(400, {"error": "invalid Content-Length"})
+            return False
+        if length > config.MAX_BODY_BYTES:
+            self.close_connection = True
+            self._send_json(413, {"error": "request body too large"})
+            return False
+        self.body = self.rfile.read(length) if length else b""
+        return True
 
     def _parse_form(self):
-        body = self._read_body()
-        data = parse_qs(body.decode("utf-8", errors="replace"))
+        data = parse_qs(self.body.decode("utf-8", errors="replace"))
         return {k: v[0] for k, v in data.items()}
 
     def _parse_json(self):
-        body = self._read_body()
-        if not body:
+        if not self.body:
             return {}
-        return json.loads(body.decode("utf-8"))
+        return json.loads(self.body.decode("utf-8"))
 
     def _check_csrf(self, form, session_row=None):
         session_row = session_row or self.session_row
@@ -178,34 +225,39 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- response helpers -------------------------------------------------
 
-    def _send_html(self, code, html_str, cookies=None):
-        body = html_str.encode("utf-8")
+    def _begin_response(self, code, content_type, length, cookies):
         self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        # Disclosed records must never be written to a browser or proxy cache.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, private")
+        self.send_header("Pragma", "no-cache")
         for c in cookies or []:
             self.send_header("Set-Cookie", c)
         self.end_headers()
+        self._responded = True
+
+    def _send_html(self, code, html_str, cookies=None):
+        body = html_str.encode("utf-8")
+        self._begin_response(code, "text/html; charset=utf-8", len(body), cookies)
         self.wfile.write(body)
 
     def _redirect(self, location, cookies=None):
         self.send_response(302)
         self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, private")
         for c in cookies or []:
             self.send_header("Set-Cookie", c)
         self.end_headers()
+        self._responded = True
 
     def _send_json(self, code, obj, cookies=None):
         body = json.dumps(obj).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        for c in cookies or []:
-            self.send_header("Set-Cookie", c)
-        self.end_headers()
+        self._begin_response(code, "application/json", len(body), cookies)
         self.wfile.write(body)
 
     def _page(self, title, body, error=None, flash=None):
@@ -262,7 +314,13 @@ def login_submit(h):
     username = (form.get("username") or "").strip()
     password = form.get("password") or ""
     user = models.get_user_by_username(h.conn, username)
-    ok = user is not None and crypto_utils.verify_password(password, user["salt"], user["password_hash"])
+    if user is None:
+        # Spend the same PBKDF2 work as a real check so response time does
+        # not reveal whether the username exists.
+        crypto_utils.verify_password(password, _DUMMY_SALT, _DUMMY_HASH)
+        ok = False
+    else:
+        ok = crypto_utils.verify_password(password, user["salt"], user["password_hash"])
     if not ok:
         audit.append_event(h.conn, "login_failed", username or "(blank)", {"reason": "bad_credentials"})
         h._send_html(200, h._page("Sign in", LOGIN_FORM, error="Invalid username or password."))
@@ -271,23 +329,30 @@ def login_submit(h):
     h._redirect("/login/totp", cookies=[build_set_cookie(PENDING_COOKIE, token, config.PENDING_LOGIN_LIFETIME_SECONDS)])
 
 
-@route("GET", "/login/totp")
-def login_totp_form(h):
-    pending = h._load_pending()
-    if not pending:
-        raise Redirect("/login")
-    body = """
+TOTP_FORM = """
 <div class="card" style="max-width:420px;margin:40px auto;">
 <h2>Two-factor verification</h2>
 <form method="post" action="/login/totp">
-<input type="hidden" name="csrf_token" value="%s">
+%s
 <label>6-digit authenticator code</label>
 <input type="text" name="code" inputmode="numeric" pattern="[0-9]*" maxlength="6" required autofocus>
 <button type="submit">Verify</button>
 </form>
 </div>
-""" % templates.escape(pending["csrf_token"])
-    h._send_html(200, h._page("Two-factor verification", body))
+"""
+
+
+def _totp_page(h, pending, error=None):
+    body = TOTP_FORM % templates.csrf_field(pending["csrf_token"])
+    return h._page("Two-factor verification", body, error=error)
+
+
+@route("GET", "/login/totp")
+def login_totp_form(h):
+    pending = h._load_pending()
+    if not pending:
+        raise Redirect("/login")
+    h._send_html(200, _totp_page(h, pending))
 
 
 @route("POST", "/login/totp")
@@ -299,20 +364,9 @@ def login_totp_submit(h):
     h._check_csrf(form, session_row=pending)
     user = models.get_user_by_id(h.conn, pending["user_id"])
     code = form.get("code", "")
-    if not user or not crypto_utils.verify_totp(user["totp_secret"], code):
+    if not user or not models.consume_totp(h.conn, user, code, "login"):
         audit.append_event(h.conn, "login_totp_failed", user["username"] if user else "(unknown)", {})
-        body = """
-<div class="card" style="max-width:420px;margin:40px auto;">
-<h2>Two-factor verification</h2>
-<form method="post" action="/login/totp">
-<input type="hidden" name="csrf_token" value="%s">
-<label>6-digit authenticator code</label>
-<input type="text" name="code" inputmode="numeric" pattern="[0-9]*" maxlength="6" required autofocus>
-<button type="submit">Verify</button>
-</form>
-</div>
-""" % templates.escape(pending["csrf_token"])
-        h._send_html(200, h._page("Two-factor verification", body, error="Invalid or expired code."))
+        h._send_html(200, _totp_page(h, pending, error="Invalid, expired, or already-used code."))
         return
     models.delete_session(h.conn, h._get_cookie(PENDING_COOKIE))
     full_token = models.create_full_session(h.conn, user["id"])
@@ -388,7 +442,7 @@ def authorizations_list(h):
     trs = []
     for r in rows:
         eff = models.effective_status(r)
-        req_cell = f"<td>{templates.escape(models.get_username(h.conn, r['requested_by']))}</td>" if show_requester else ""
+        req_cell = f"<td>{templates.escape(r['requester_username'])}</td>" if show_requester else ""
         trs.append(f"""<tr>
 <td><a href="/authorizations/{r['id']}">#{r['id']}</a></td>
 <td>{templates.escape(r['case_number'])}</td>
@@ -482,8 +536,8 @@ def new_authorization_submit(h):
 
 def _authorization_detail_body(h, user, auth_row):
     eff = models.effective_status(auth_row)
-    requester_name = models.get_username(h.conn, auth_row["requested_by"])
-    approver_name = models.get_username(h.conn, auth_row["approved_by"]) if auth_row["approved_by"] else None
+    requester_name = auth_row["requester_username"]
+    approver_name = auth_row["approver_username"]
 
     rows = f"""
 <tr><th>Case number</th><td>{templates.escape(auth_row['case_number'])}</td></tr>
@@ -528,7 +582,7 @@ def _authorization_detail_body(h, user, auth_row):
 @route("GET", r"/authorizations/(?P<auth_id>\d+)")
 def authorization_detail(h, auth_id):
     user = h._require_login()
-    auth_row = models.get_authorization(h.conn, int(auth_id))
+    auth_row = models.get_authorization_with_names(h.conn, int(auth_id))
     if not auth_row:
         raise HttpError(404, "Authorization not found.")
     if user["role"] == "requester" and auth_row["requested_by"] != user["id"]:
@@ -574,9 +628,11 @@ def approve_submit(h, auth_id):
     if auth_row["requested_by"] == user["id"]:
         audit.append_event(h.conn, "self_approval_denied", user["username"], {"authorization_id": int(auth_id)})
         raise HttpError(403, "You cannot approve your own request.")
-    if not crypto_utils.verify_totp(user["totp_secret"], form.get("code", "")):
+    # A fresh code per approval: consuming it prevents one code from
+    # rubber-stamping several requests inside the same 30-second step.
+    if not models.consume_totp(h.conn, user, form.get("code", ""), "approval"):
         audit.append_event(h.conn, "approval_totp_failed", user["username"], {"authorization_id": int(auth_id)})
-        raise HttpError(403, "Invalid authenticator code.")
+        raise HttpError(403, "Invalid, expired, or already-used authenticator code.")
     ok, reason = models.approve_authorization(h.conn, int(auth_id), user["id"])
     if not ok:
         audit.append_event(h.conn, "approval_denied", user["username"], {
@@ -753,19 +809,41 @@ def ingest(h):
     except (json.JSONDecodeError, UnicodeDecodeError):
         h._send_json(400, {"error": "invalid JSON body"})
         return
+    if not isinstance(payload, dict):
+        h._send_json(400, {"error": "body must be a JSON object"})
+        return
 
     plate = str(payload.get("plate", "")).strip().upper()
     if not plate:
         h._send_json(400, {"error": "plate is required"})
         return
-    camera_id = str(payload.get("camera_id", "unknown-camera")).strip()
-    captured_at = payload.get("captured_at") or datetime.now(timezone.utc).isoformat()
+    if len(plate) > MAX_PLATE_LEN:
+        h._send_json(400, {"error": f"plate exceeds {MAX_PLATE_LEN} characters"})
+        return
+
+    camera_id = str(payload.get("camera_id", "unknown-camera")).strip()[:MAX_FIELD_LEN]
+    source_id = str(payload.get("source_id", "unknown-source")).strip()[:MAX_FIELD_LEN]
+    location = payload.get("location")
+    if location is not None:
+        location = str(location).strip()[:MAX_FIELD_LEN]
+
+    # Normalize to canonical UTC now, at the trust boundary. Cameras from
+    # different vendors emit different ISO-8601 flavors, and the stored value
+    # is range-compared as text when an authorized search runs.
+    raw_captured_at = payload.get("captured_at")
+    try:
+        captured_at = timeutil.parse(raw_captured_at) if raw_captured_at else timeutil.now_iso()
+    except ValueError:
+        h._send_json(400, {"error": "captured_at is not a valid ISO-8601 timestamp"})
+        return
+
     try:
         confidence = float(payload.get("confidence", 0.9))
     except (TypeError, ValueError):
         confidence = 0.9
-    location = payload.get("location")
-    source_id = str(payload.get("source_id", "unknown-source")).strip()
+    if not 0.0 <= confidence <= 1.0:
+        h._send_json(400, {"error": "confidence must be between 0.0 and 1.0"})
+        return
 
     event_id = models.insert_event(h.conn, plate, captured_at, camera_id, confidence, location, source_id)
     audit.append_event(h.conn, "sensor_ingest", f"sensor:{source_id}", {

@@ -32,7 +32,12 @@ def verify(db_path):
         conn.close()
 
     expected_prev = GENESIS_HASH
+    expected_seq = 1
     for row in rows:
+        # A gap means an entry was removed, even if the surviving links
+        # still hash correctly among themselves.
+        if row["seq"] != expected_seq:
+            return False, row["seq"], f"sequence gap: expected seq={expected_seq}, found seq={row['seq']}"
         if row["prev_hash"] != expected_prev:
             return False, row["seq"], "prev_hash does not match the previous entry's hash"
         recomputed = _entry_hash(
@@ -41,6 +46,7 @@ def verify(db_path):
         if recomputed != row["hash"]:
             return False, row["seq"], "stored hash does not match recomputed hash (possible tampering)"
         expected_prev = row["hash"]
+        expected_seq += 1
     return True, len(rows), None
 
 

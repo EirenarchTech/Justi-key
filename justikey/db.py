@@ -1,6 +1,12 @@
 """SQLite schema and connection helpers.
 
 Uses only the Python standard library (sqlite3).
+
+Connections are opened in autocommit mode so that code needing atomicity
+can request it explicitly with BEGIN IMMEDIATE (see audit.append_event),
+rather than relying on sqlite3's implicit transaction handling. The
+server is threaded, so a busy timeout is set to make concurrent writers
+wait for the write lock instead of failing outright.
 """
 import sqlite3
 
@@ -25,6 +31,20 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+-- Records a TOTP code that has already been spent, so the same code cannot
+-- be replayed within the same security context. Scoped by purpose so that
+-- each approval requires its own fresh code (an approver cannot rubber-stamp
+-- several requests with one code) without forcing a user to wait out a full
+-- time step between signing in and acting.
+CREATE TABLE IF NOT EXISTS used_totp (
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    counter INTEGER NOT NULL,
+    purpose TEXT NOT NULL,
+    used_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, counter, purpose)
+);
 
 CREATE TABLE IF NOT EXISTS lpr_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,8 +56,13 @@ CREATE TABLE IF NOT EXISTS lpr_events (
     source_id TEXT,
     ingested_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_events_plate ON lpr_events(plate);
-CREATE INDEX IF NOT EXISTS idx_events_captured_at ON lpr_events(captured_at);
+-- Authorized search always filters on plate AND a captured_at range, so a
+-- composite index serves the whole predicate and returns rows already
+-- ordered. It also covers plate-only lookups, so no separate plate index
+-- is needed.
+CREATE INDEX IF NOT EXISTS idx_events_plate_time ON lpr_events(plate, captured_at);
+DROP INDEX IF EXISTS idx_events_plate;
+DROP INDEX IF EXISTS idx_events_captured_at;
 
 CREATE TABLE IF NOT EXISTS authorizations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,9 +103,16 @@ CREATE TABLE IF NOT EXISTS api_keys (
 
 
 def get_connection(db_path=None):
-    conn = sqlite3.connect(db_path or config.DB_PATH)
+    conn = sqlite3.connect(db_path or config.DB_PATH, timeout=config.SQLITE_BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
+    # Autocommit: transactions are opened explicitly where atomicity matters.
+    conn.isolation_level = None
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = %d" % int(config.SQLITE_BUSY_TIMEOUT_SECONDS * 1000))
+    # WAL lets readers proceed while a writer holds the lock. Ignored for
+    # in-memory databases, which tests use.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -88,6 +120,5 @@ def init_db(db_path=None):
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA)
-        conn.commit()
     finally:
         conn.close()

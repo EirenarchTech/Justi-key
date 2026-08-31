@@ -16,6 +16,13 @@ APPROVAL_VALIDITY_SECONDS = int(os.environ.get("JUSTIKEY_APPROVAL_VALIDITY", 30 
 # Password hashing.
 PBKDF2_ITERATIONS = int(os.environ.get("JUSTIKEY_PBKDF2_ITERATIONS", 200_000))
 
+# How long a writer waits for SQLite's write lock before giving up. The
+# server is threaded, so concurrent ingest requests do contend.
+SQLITE_BUSY_TIMEOUT_SECONDS = float(os.environ.get("JUSTIKEY_SQLITE_TIMEOUT", 10.0))
+
+# Largest request body accepted, for form posts and sensor observations alike.
+MAX_BODY_BYTES = int(os.environ.get("JUSTIKEY_MAX_BODY_BYTES", 64 * 1024))
+
 # Only set JUSTIKEY_COOKIE_SECURE=1 when serving over HTTPS (production).
 COOKIE_SECURE = os.environ.get("JUSTIKEY_COOKIE_SECURE", "0") == "1"
 

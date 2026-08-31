@@ -57,18 +57,27 @@ def totp_now(secret_b32, step=30, digits=6, t=None):
     return _hotp(secret_b32, int(t // step), digits)
 
 
-def verify_totp(secret_b32, code, step=30, digits=6, window=1, t=None):
+def match_totp_counter(secret_b32, code, step=30, digits=6, window=1, t=None):
+    """Return the time-step counter a code matches, or None.
+
+    Callers that must prevent replay need to know *which* step was used so
+    they can record it as spent; verify_totp is the plain boolean form.
+    """
     if not code:
-        return False
+        return None
     code = code.strip()
     if not code.isdigit():
-        return False
+        return None
     t = t if t is not None else time.time()
     counter = int(t // step)
     for w in range(-window, window + 1):
         if hmac.compare_digest(_hotp(secret_b32, counter + w, digits), code.zfill(digits)):
-            return True
-    return False
+            return counter + w
+    return None
+
+
+def verify_totp(secret_b32, code, step=30, digits=6, window=1, t=None):
+    return match_totp_counter(secret_b32, code, step, digits, window, t) is not None
 
 
 # ---------------------------------------------------------------------------

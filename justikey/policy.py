@@ -6,7 +6,7 @@ request: ownership, approval state, expiration, exact target-plate match,
 and the authorized date/time window. If any condition fails, disclosure
 is denied and the reason is returned so the caller can audit it.
 """
-from . import audit, models
+from . import models, timeutil
 
 DENIAL_MESSAGES = {
     "authorization_not_found": "No such authorization exists.",
@@ -29,8 +29,7 @@ def evaluate_disclosure(conn, auth_id, requested_plate, actor_user):
     if auth_row["status"] != "approved":
         return False, "authorization_not_approved", []
 
-    now = audit.now_iso()
-    if not auth_row["approval_expires_at"] or auth_row["approval_expires_at"] < now:
+    if not auth_row["approval_expires_at"] or auth_row["approval_expires_at"] <= timeutil.now_iso():
         return False, "authorization_expired", []
 
     if requested_plate.strip().upper() != auth_row["target_plate"]:

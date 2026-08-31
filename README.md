@@ -95,9 +95,12 @@ scripts/
   verify_audit.py  independent CLI audit-chain verifier
 
 tests/
-  test_totp.py     TOTP + password hashing correctness
-  test_audit.py    hash-chain integrity, including tamper detection
-  test_policy.py   disclosure policy: ownership, approval, expiry, plate match
+  test_totp.py        TOTP + password hashing correctness
+  test_totp_replay.py single-use enforcement for TOTP codes
+  test_audit.py       hash-chain integrity, including tamper detection
+  test_policy.py      disclosure policy: ownership, approval, expiry, plate match
+  test_timeutil.py    canonical timestamps; window filtering across vendor formats
+  test_concurrency.py no audit entry lost under concurrent append; atomic approval
 ```
 
 ### Core principle: collection is not access
@@ -119,11 +122,17 @@ just hidden in the UI, and is covered by `tests/test_policy.py`.
 
 - PBKDF2-HMAC-SHA256 password hashing (200,000 iterations, random salt).
 - RFC 6238 TOTP, required at login and again before approving a request.
+- TOTP codes are single-use per security context, so one code cannot
+  approve two requests inside the same 30-second step.
+- Login spends the same PBKDF2 work whether or not the username exists, so
+  response time does not turn the login form into a username oracle.
 - Random 256-bit session tokens; only a SHA-256 hash of the token is
   stored server-side.
 - HttpOnly, `SameSite=Lax` session cookies (add `JUSTIKEY_COOKIE_SECURE=1`
   when serving over HTTPS in a real deployment).
 - CSRF tokens bound to the session, required on every state-changing POST.
+- `Cache-Control: no-store` on every response, so disclosed records are
+  never written to a browser or proxy cache.
 
 ### Narrowly scoped disclosure
 
@@ -135,6 +144,15 @@ window are returned. Approval expires ~30 minutes after being granted
 (`JUSTIKEY_APPROVAL_VALIDITY`), after which a fresh authorization is
 required.
 
+Scoping is only as trustworthy as the time comparison behind it. Because
+the ingest API is deliberately camera-independent, it receives whatever
+ISO-8601 flavor a vendor emits, and timestamps are range-compared as text
+in SQLite. Every timestamp is therefore normalized at the trust boundary to
+one fixed-width UTC form (`justikey/timeutil.py`), so lexicographic order
+always equals chronological order. Without that, a `Z` suffix or a naive
+timestamp sorts outside a window it genuinely falls inside, and an
+investigator holding a valid warrant silently receives incomplete results.
+
 ### Tamper-evident audit ledger
 
 Every sensitive action — logins (success/failure), authorization requests,
@@ -143,6 +161,21 @@ disclosures, and sensor ingestion — is appended to `audit_log` with a
 SHA-256 hash over its own fields *and* the previous entry's hash. Altering
 or deleting any row breaks the chain from that point forward, which
 `scripts/verify_audit.py` and the in-app `/audit/verify` page both detect.
+
+Appends are wrapped in a `BEGIN IMMEDIATE` transaction. The server is
+threaded, so reading the chain head and writing the next link has to be one
+atomic step; otherwise two concurrent appends compute the same sequence
+number, one loses the uniqueness race, and the entry is dropped while the
+surviving chain still verifies clean — a silent hole in exactly the record
+the ledger exists to keep. Verification also checks for sequence gaps, not
+just hash continuity, since removing a whole entry leaves the remaining
+links internally consistent.
+
+**Known limitation:** a hash chain cannot detect truncation of its own
+tail. Deleting the most recent N entries leaves a shorter but perfectly
+valid chain. Detecting that requires an anchor outside the database — a
+countersigned checkpoint, WORM storage, or an external witness — which is
+listed below as production work.
 
 ## Running the tests
 
@@ -161,8 +194,14 @@ not implement (and a production JustiKey should add):
 - Enterprise identity, hardware-backed MFA, FIDO2/WebAuthn, or CAC/PIV in
   place of the deterministic demo accounts.
 - Cryptographically signed/verified warrant documents.
-- Externally anchored or WORM audit storage.
-- Retention policies, legal holds, multi-tenancy, rate limiting, intrusion
-  monitoring, and incident-response tooling.
+- Externally anchored or WORM audit storage (see the tail-truncation
+  limitation above).
+- Rate limiting and lockout on the login and ingest endpoints. Nothing here
+  throttles password guessing, and a caller with a bad API key can still
+  drive audit writes.
+- Retention policies, legal holds, multi-tenancy, intrusion monitoring, and
+  incident-response tooling.
+- A durable job to prune spent TOTP records and expired sessions; the
+  prototype purges sessions opportunistically at login.
 
 See the platform description for the full production security roadmap.
