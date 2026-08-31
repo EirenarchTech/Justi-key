@@ -20,16 +20,13 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import anchor, audit, config, crypto_utils, db, models, policy, templates, timeutil
+from . import (adapters, anchor, audit, config, crypto_utils, db, models, policy,
+               templates, timeutil)
 
 SESSION_COOKIE = config.SESSION_COOKIE_NAME
 PENDING_COOKIE = config.PENDING_COOKIE_NAME
 
 ROLES = ("requester", "approver", "auditor")
-
-# Field limits for sensor-supplied observation data.
-MAX_PLATE_LEN = 16
-MAX_FIELD_LEN = 128
 
 # A fixed hash used to spend the same PBKDF2 work on a login attempt for an
 # unknown username as for a known one. Without it, an unknown username
@@ -870,57 +867,77 @@ control.</p>
 
 @route("POST", "/ingest")
 def ingest(h):
+    """Accept observations from any registered sensor feed.
+
+    The credential decides who the sender is; the source's registered adapter
+    decides how to read what they sent. A payload cannot name its own source,
+    so audit attribution here is authenticated rather than self-declared.
+    """
     api_key = h.headers.get(config.INGEST_API_KEY_HEADER)
-    if not models.verify_api_key(h.conn, api_key):
-        audit.append_event(h.conn, "ingest_denied", "sensor:unknown", {"reason": "bad_api_key"})
-        h._send_json(401, {"error": "invalid or missing API key"})
+    source = models.authenticate_source(h.conn, api_key)
+    if source is None:
+        audit.append_event(h.conn, "ingest_denied", "sensor:unauthenticated",
+                           {"reason": "unknown, revoked, or inactive credential"})
+        h._send_json(401, {"error": "invalid, revoked, or inactive ingest credential"})
         return
+
     try:
         payload = h._parse_json()
     except (json.JSONDecodeError, UnicodeDecodeError):
         h._send_json(400, {"error": "invalid JSON body"})
         return
-    if not isinstance(payload, dict):
+
+    # A source may send one observation or a batch; batching matters for edge
+    # devices reconnecting after an outage with buffered reads.
+    if isinstance(payload, dict) and isinstance(payload.get("observations"), list):
+        batch = payload["observations"]
+    elif isinstance(payload, dict):
+        batch = [payload]
+    else:
         h._send_json(400, {"error": "body must be a JSON object"})
         return
-
-    plate = str(payload.get("plate", "")).strip().upper()
-    if not plate:
-        h._send_json(400, {"error": "plate is required"})
+    if not batch:
+        h._send_json(400, {"error": "no observations supplied"})
         return
-    if len(plate) > MAX_PLATE_LEN:
-        h._send_json(400, {"error": f"plate exceeds {MAX_PLATE_LEN} characters"})
+    if len(batch) > config.MAX_BATCH_OBSERVATIONS:
+        h._send_json(413, {"error": f"batch exceeds {config.MAX_BATCH_OBSERVATIONS} observations"})
         return
 
-    camera_id = str(payload.get("camera_id", "unknown-camera")).strip()[:MAX_FIELD_LEN]
-    source_id = str(payload.get("source_id", "unknown-source")).strip()[:MAX_FIELD_LEN]
-    location = payload.get("location")
-    if location is not None:
-        location = str(location).strip()[:MAX_FIELD_LEN]
+    accepted, rejected = [], []
+    for index, item in enumerate(batch):
+        try:
+            obs = adapters.normalize(source["adapter"], item)
+        except adapters.AdapterError as exc:
+            rejected.append({"index": index, "error": str(exc)})
+            continue
+        event_id = models.insert_event(
+            h.conn, obs["plate"], obs["captured_at"], obs["camera_id"], obs["confidence"],
+            obs["location"], obs["source_label"],
+            source_ref=source["id"], adapter=source["adapter"],
+        )
+        accepted.append(event_id)
 
-    # Normalize to canonical UTC now, at the trust boundary. Cameras from
-    # different vendors emit different ISO-8601 flavors, and the stored value
-    # is range-compared as text when an authorized search runs.
-    raw_captured_at = payload.get("captured_at")
-    try:
-        captured_at = timeutil.parse(raw_captured_at) if raw_captured_at else timeutil.now_iso()
-    except ValueError:
-        h._send_json(400, {"error": "captured_at is not a valid ISO-8601 timestamp"})
-        return
+    if accepted:
+        audit.append_event(h.conn, "sensor_ingest", f"source:{source['source_key']}", {
+            "source_id": source["id"], "adapter": source["adapter"],
+            "accepted": len(accepted), "rejected": len(rejected),
+        })
+    if rejected:
+        # Malformed observations are logged too: a feed quietly failing to
+        # deliver is an availability problem an operator needs to see.
+        audit.append_event(h.conn, "ingest_rejected", f"source:{source['source_key']}", {
+            "source_id": source["id"], "rejected": len(rejected),
+            "first_error": rejected[0]["error"],
+        })
 
-    try:
-        confidence = float(payload.get("confidence", 0.9))
-    except (TypeError, ValueError):
-        confidence = 0.9
-    if not 0.0 <= confidence <= 1.0:
-        h._send_json(400, {"error": "confidence must be between 0.0 and 1.0"})
-        return
-
-    event_id = models.insert_event(h.conn, plate, captured_at, camera_id, confidence, location, source_id)
-    audit.append_event(h.conn, "sensor_ingest", f"sensor:{source_id}", {
-        "event_id": event_id, "camera_id": camera_id,
-    })
-    h._send_json(201, {"status": "accepted", "event_id": event_id})
+    status = 201 if accepted else 400
+    body = {"status": "accepted" if accepted else "rejected",
+            "accepted": len(accepted), "rejected": len(rejected)}
+    if len(batch) == 1 and accepted:
+        body["event_id"] = accepted[0]
+    if rejected:
+        body["errors"] = rejected[:10]
+    h._send_json(status, body)
 
 
 # ===========================================================================

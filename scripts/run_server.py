@@ -32,6 +32,7 @@ def main():
             print(f"  role={role:10s} username={username:12s} password={password:16s} totp_secret={secret}")
         if api_key:
             print(f"  sensor ingest API key: {api_key}")
+            print(f"  (source '{seed.DEMO_SOURCE_KEY}'; manage feeds with scripts/manage_sources.py)")
         print("Get a current 2FA code for a demo account with:")
         print("  python scripts/show_totp.py <username>")
         print("========================================================================")

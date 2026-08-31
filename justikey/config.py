@@ -23,6 +23,10 @@ SQLITE_BUSY_TIMEOUT_SECONDS = float(os.environ.get("JUSTIKEY_SQLITE_TIMEOUT", 10
 # Largest request body accepted, for form posts and sensor observations alike.
 MAX_BODY_BYTES = int(os.environ.get("JUSTIKEY_MAX_BODY_BYTES", 64 * 1024))
 
+# Most observations one ingest request may carry. Edge devices reconnecting
+# after an outage flush buffered reads in batches.
+MAX_BATCH_OBSERVATIONS = int(os.environ.get("JUSTIKEY_MAX_BATCH", 500))
+
 # Only set JUSTIKEY_COOKIE_SECURE=1 when serving over HTTPS (production).
 COOKIE_SECURE = os.environ.get("JUSTIKEY_COOKIE_SECURE", "0") == "1"
 

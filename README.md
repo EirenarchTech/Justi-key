@@ -96,6 +96,7 @@ justikey/
   audit.py       hash-chained audit ledger (append + verify)
   models.py      data access: users, sessions, events, authorizations
   anchor.py      signed checkpoints making tail truncation detectable
+  adapters.py    vendor payload translation into one canonical observation
   policy.py      disclosure policy engine — the only path to protected data
   templates.py   minimal HTML templating (all interpolation is escaped)
   webapp.py      http.server-based router, auth flow, CSRF, all routes
@@ -107,6 +108,8 @@ scripts/
   show_totp.py      dev helper: current TOTP code for a demo account
   anchor_audit.py   publish a checkpoint of the ledger head on demand
   witness_server.py independent witness holding its own copy of checkpoints
+  manage_sources.py register, rotate, suspend, and revoke sensor feeds
+  edge_agent.py     device-side recognition with store-and-forward buffering
   verify_audit.py   independent verifier: chain + anchors + witness
 
 tests/
@@ -118,7 +121,170 @@ tests/
   test_concurrency.py no audit entry lost under concurrent append; atomic approval
   test_anchor.py      truncation, rewrite, and forged-anchor detection
   test_verify_cli.py  the standalone verifier's own reimplementation of the checks
+  test_sources.py     authenticated provenance, revocation isolation, migration
+  test_adapters.py    vendor translation, timestamps, confidence, candidates
+  test_edge_agent.py  buffering, once-only recognition, recognizer parsing
 ```
+
+## Integrating other LPR systems
+
+JustiKey's privacy architecture is indifferent to who made the camera, which
+only works if every upstream format is reduced to one canonical observation
+at the trust boundary. Integration therefore has two halves: **who is
+sending** (identity) and **what they sent** (translation).
+
+### Sources: authenticated identity, independent revocation
+
+Every camera, edge device, or upstream ALPR system is a registered *source*
+with its own credential:
+
+```bash
+python3 scripts/manage_sources.py register gate-north "North gate camera" \
+    --adapter justikey --operator "in-house"
+python3 scripts/manage_sources.py list
+python3 scripts/manage_sources.py rotate gate-north      # new key, retire old
+python3 scripts/manage_sources.py suspend gate-north     # pause a feed
+python3 scripts/manage_sources.py revoke gate-north      # cut one vendor off
+```
+
+Two properties matter and neither is cosmetic:
+
+**Revocation is per-source.** Cutting off one vendor leaves every other feed
+running. A single shared ingest key cannot do this — revoking it stops
+everything, so in practice nobody revokes it.
+
+**Provenance is proven, not claimed.** The source an observation is
+attributed to comes from the credential it authenticated with. A payload may
+still carry the vendor's own feed name; it is stored as `source_id` (a claim,
+kept for troubleshooting) and never becomes identity. The authenticated
+source is `source_ref`, and it is what audit attribution and provenance use.
+Ingest audit entries read `source:gate-north` because that source proved it,
+not because the payload said so.
+
+Credentials are separate rows from source identity, so a key can be rotated
+or one of several revoked without disturbing the feed's history.
+
+### Adapters: one observation shape
+
+Each source declares the payload format it speaks, and `justikey/adapters.py`
+translates it. Three ship today:
+
+| adapter | shape |
+|---|---|
+| `justikey` | JustiKey's native observation |
+| `flat_epoch_v1` | flat fields, epoch timestamps, 0–100 score |
+| `nested_results_v1` | recognizer output with a ranked `results` array |
+
+Adapters normalize the things that silently corrupt a scoped search:
+timestamps become one fixed-width UTC form regardless of epoch-millis, `Z`
+suffix, or offset; confidence becomes 0.0–1.0 whether the vendor sent a
+fraction or a percentage. For `nested_results_v1`, only the winning candidate
+is stored — keeping rejected guesses about a vehicle would widen the
+protected record for no investigative benefit.
+
+Sending the wrong format for a source's adapter is rejected with a 400 rather
+than silently mangled.
+
+**These are reference patterns, not certified vendor integrations.** The two
+generic adapters model the payload shapes that dominate in practice. A real
+vendor adapter needs that vendor's specification and captured sample
+payloads, and should ship with fixtures of those samples in the test suite.
+Add one with `@adapter("name")` and set the source's `adapter` column.
+
+### Batch ingest and intermittent links
+
+`/ingest` accepts either a single observation or
+`{"observations": [...]}`. Each item is translated independently: valid ones
+are stored, invalid ones are reported per-index and audited, so one
+malformed read does not discard a whole batch. Batching is what lets an edge
+device flush a backlog after an outage.
+
+### The federation hazard — read before building outbound query
+
+Several commercial ALPR networks expose *search* APIs, and "let investigators
+query them from JustiKey too" is the obvious next feature. Built naively it
+would destroy the product.
+
+Every control here — the warrant record, the second approver, the plate and
+time scope, the audit entry — governs the local event store. An outbound
+query to a third-party network that skipped those checks would let anyone
+with a JustiKey login obtain exactly the history JustiKey exists to protect,
+while the audit ledger recorded nothing. JustiKey would become a laundering
+layer that makes unaccountable search look accountable.
+
+If federated query is built, it must be strictly harder than local search,
+never easier:
+
+- An outbound query requires an approved, unexpired authorization, checked by
+  the same policy engine, before any request leaves the building.
+- The remote query is constrained to the authorized plate and time window;
+  the authorization is the only thing that can widen it.
+- The request *and* its response are audited — including a query that
+  returned nothing, since a null result still reveals that someone asked.
+- Results are held under the same scope and expiry as local records, not
+  cached into a parallel store that outlives the authorization.
+- Each federated network is a peer with its own credential and its own
+  revocation, exactly as inbound sources are.
+
+None of this is implemented. It is written down because the safe design and
+the naive one look similar at the API layer and diverge completely in what
+they permit.
+
+## Building our own cameras
+
+The edge agent (`scripts/edge_agent.py`) is the device-side half, and it runs
+today:
+
+```bash
+python3 scripts/edge_agent.py --api-key KEY --watch ./captures \
+    --camera-id gate-north-01 --delete-after
+```
+
+It watches a directory the camera writes frames into, recognizes plates,
+buffers observations to disk, and flushes them in batches when the link
+returns. A frame is recognized once and only once — tracked across restarts,
+because re-reading frames would invent observations that never happened.
+
+**Recognition is pluggable.** JustiKey depends on nothing outside the
+standard library, so no CV stack ships here. `--recognizer stub` produces
+deterministic fake reads so the whole pipeline can be exercised without a
+camera. `--recognizer command` shells out to any engine and parses its output
+(JSON or `PLATE,CONFIDENCE` lines). Swapping engines never touches JustiKey.
+
+The device holds no policy, answers no queries, and keeps no history beyond
+its send buffer. A stolen camera yields almost nothing: its credential is
+revocable on its own, and it cannot search anything. Prefer `--delete-after`
+in the field — the frame is more sensitive than the plate read.
+
+### What building the hardware actually involves
+
+The honest split: the integration and privacy work above is done, and the
+recognition work is a genuine, separate engineering effort. The hard parts
+are optics and ML, not the JustiKey interface.
+
+- **Optics dominate.** Plates are retroreflective, so IR illumination and a
+  matched IR-pass filter matter more than sensor megapixels. A short exposure
+  is needed to freeze a moving vehicle, which forces the illuminator to be
+  strong. Fixed focus at a known distance and a narrow field of view beat a
+  wide general-purpose lens.
+- **Compute.** A Raspberry Pi 5 class board handles a single lane at modest
+  frame rates; heavier detector plus OCR models want something like a Jetson
+  Orin Nano. Decide the frame budget before choosing models.
+- **Recognition.** Plate detection then OCR, as two stages. Accuracy is an
+  iterative grind against motion blur, skew, weather, night glare, and
+  regional plate formats — not a one-time integration.
+- **Licensing.** Check the license of any engine before it ships in a
+  product; some well-known ALPR engines are AGPL, which has real
+  implications for a commercial deployment.
+- **Field reality.** Mounting angle, enclosure heat, lens cleaning, and power
+  determine real-world accuracy at least as much as the model does.
+
+A sensible order is: prove the pipeline end-to-end with the stub recognizer
+(done), swap in an off-the-shelf engine behind `--recognizer command` and
+measure accuracy on real footage from the intended mounting position, and
+only then decide whether custom hardware and a custom model earn their cost.
+Nothing above that line requires custom hardware, and the JustiKey interface
+does not change when you cross it.
 
 ### Core principle: collection is not access
 

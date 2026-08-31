@@ -11,3 +11,8 @@ __pycache__/
 *.anchor-key
 *.anchors.jsonl
 witness.jsonl
+
+# Edge agent runtime state (buffered observations may contain plate reads).
+edge_buffer.jsonl
+edge_processed.json
+captures/

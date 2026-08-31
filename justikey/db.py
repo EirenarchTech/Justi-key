@@ -53,9 +53,18 @@ CREATE TABLE IF NOT EXISTS lpr_events (
     camera_id TEXT NOT NULL,
     confidence REAL NOT NULL,
     location TEXT,
+    -- The feed name the payload claimed: a hint for troubleshooting, never
+    -- an identity.
     source_id TEXT,
+    -- The registered source that actually authenticated, and the payload
+    -- format it arrived in. These are the trustworthy provenance fields.
+    source_ref INTEGER REFERENCES sources(id),
+    adapter TEXT,
     ingested_at TEXT NOT NULL
 );
+-- The index on source_ref is created by migrate(), not here: on an existing
+-- database this script runs before the column has been added, and indexing a
+-- column that does not yet exist would abort the whole upgrade.
 -- Authorized search always filters on plate AND a captured_at range, so a
 -- composite index serves the whole predicate and returns rows already
 -- ordered. It also covers plate-only lookups, so no separate plate index
@@ -99,7 +108,43 @@ CREATE TABLE IF NOT EXISTS api_keys (
     label TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- A registered sensor feed: one camera, one edge device, or one upstream
+-- ALPR system. Every observation is attributed to the source proven by the
+-- credential it authenticated with, never to a name the payload claims.
+CREATE TABLE IF NOT EXISTS sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_key TEXT UNIQUE NOT NULL,
+    display_name TEXT NOT NULL,
+    adapter TEXT NOT NULL DEFAULT 'justikey',
+    operator TEXT,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active', 'suspended', 'revoked')),
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+
+-- Credentials are separate from identity so a key can be rotated, or one of
+-- several issued keys revoked, without disturbing the source's history or
+-- the provenance already recorded against it.
+CREATE TABLE IF NOT EXISTS source_credentials (
+    key_hash TEXT PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_source_credentials_source ON source_credentials(source_id);
 """
+
+# Columns added to lpr_events after the original schema shipped. Applied by
+# init_db so existing databases pick them up.
+EVENT_COLUMNS = (
+    # The authenticated source: which registered feed proved its identity.
+    ("source_ref", "INTEGER REFERENCES sources(id)"),
+    # Which payload format this observation arrived in.
+    ("adapter", "TEXT"),
+)
 
 
 def get_connection(db_path=None):
@@ -116,9 +161,47 @@ def get_connection(db_path=None):
     return conn
 
 
+def migrate(conn):
+    """Apply additive schema changes to an existing database."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(lpr_events)")}
+    for column, decl in EVENT_COLUMNS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE lpr_events ADD COLUMN {column} {decl}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_source_ref ON lpr_events(source_ref)")
+
+    # Keys issued before per-source identity existed still work, but are now
+    # attributed to an explicit legacy source rather than to whatever name a
+    # payload claimed. Their raw values were never stored, so the hashes move
+    # across as-is.
+    orphans = conn.execute(
+        "SELECT key_hash, label, created_at FROM api_keys WHERE key_hash NOT IN "
+        "(SELECT key_hash FROM source_credentials)"
+    ).fetchall()
+    if orphans:
+        from . import timeutil
+        now = timeutil.now_iso()
+        row = conn.execute("SELECT id FROM sources WHERE source_key=?", ("legacy-api-key",)).fetchone()
+        if row is None:
+            cur = conn.execute(
+                "INSERT INTO sources (source_key, display_name, adapter, operator, status, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                ("legacy-api-key", "Legacy shared ingest key", "justikey",
+                 "pre-migration", "active", now))
+            source_id = cur.lastrowid
+        else:
+            source_id = row["id"]
+        for orphan in orphans:
+            conn.execute(
+                "INSERT INTO source_credentials (key_hash, source_id, label, created_at) "
+                "VALUES (?,?,?,?)",
+                (orphan["key_hash"], source_id, orphan["label"], orphan["created_at"]))
+
+
 def init_db(db_path=None):
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA)
+        migrate(conn)
     finally:
         conn.close()

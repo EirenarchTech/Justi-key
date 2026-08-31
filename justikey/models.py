@@ -113,12 +113,20 @@ def delete_session(conn, token):
 # LPR events (protected event store)
 # ---------------------------------------------------------------------------
 
-def insert_event(conn, plate, captured_at, camera_id, confidence, location, source_id):
+def insert_event(conn, plate, captured_at, camera_id, confidence, location, source_id,
+                 source_ref=None, adapter=None):
+    """Store an observation.
+
+    `source_id` is the vendor's own label for the feed -- a claim carried in
+    the payload. `source_ref` is the registered source that actually proved
+    its identity with a credential. Only the latter is trustworthy, and it is
+    what provenance and audit attribution use.
+    """
     cur = conn.execute(
-        "INSERT INTO lpr_events (plate, captured_at, camera_id, confidence, location, source_id, ingested_at) "
-        "VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO lpr_events (plate, captured_at, camera_id, confidence, location, "
+        "source_id, source_ref, adapter, ingested_at) VALUES (?,?,?,?,?,?,?,?,?)",
         (plate, timeutil.parse(captured_at), camera_id, confidence, location, source_id,
-         timeutil.now_iso()),
+         source_ref, adapter, timeutil.now_iso()),
     )
     return cur.lastrowid
 
@@ -276,3 +284,89 @@ def verify_api_key(conn, key):
 
 def count_audit_entries(conn):
     return conn.execute("SELECT COUNT(*) c FROM audit_log").fetchone()["c"]
+
+
+# ---------------------------------------------------------------------------
+# Sensor sources: registered feeds and their credentials
+# ---------------------------------------------------------------------------
+
+def create_source(conn, source_key, display_name, adapter="justikey", operator=None):
+    cur = conn.execute(
+        "INSERT INTO sources (source_key, display_name, adapter, operator, status, created_at) "
+        "VALUES (?,?,?,?, 'active', ?)",
+        (source_key, display_name, adapter, operator, timeutil.now_iso()),
+    )
+    return cur.lastrowid
+
+
+def get_source(conn, source_id):
+    return conn.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
+
+
+def get_source_by_key(conn, source_key):
+    return conn.execute("SELECT * FROM sources WHERE source_key=?", (source_key,)).fetchone()
+
+
+def list_sources(conn):
+    return conn.execute(
+        "SELECT s.*, "
+        "(SELECT COUNT(*) FROM source_credentials c "
+        "  WHERE c.source_id = s.id AND c.revoked_at IS NULL) AS active_credentials, "
+        "(SELECT COUNT(*) FROM lpr_events e WHERE e.source_ref = s.id) AS observation_count "
+        "FROM sources s ORDER BY s.created_at ASC"
+    ).fetchall()
+
+
+def issue_source_credential(conn, source_id, label="default"):
+    """Mint a new ingest key for a source. Returns the raw key, shown once."""
+    key = crypto_utils.new_token(24)
+    conn.execute(
+        "INSERT INTO source_credentials (key_hash, source_id, label, created_at) "
+        "VALUES (?,?,?,?)",
+        (crypto_utils.hash_token(key), source_id, label, timeutil.now_iso()),
+    )
+    return key
+
+
+def authenticate_source(conn, key):
+    """Resolve an ingest credential to the source that owns it.
+
+    Returns the source row, or None when the key is unknown, the credential
+    has been revoked, or the source itself is no longer active. Revoking one
+    credential or one source leaves every other feed untouched -- the reason
+    identity is per-source rather than one shared key.
+    """
+    if not key:
+        return None
+    row = conn.execute(
+        "SELECT s.* FROM source_credentials c JOIN sources s ON s.id = c.source_id "
+        "WHERE c.key_hash = ? AND c.revoked_at IS NULL AND s.status = 'active'",
+        (crypto_utils.hash_token(key),),
+    ).fetchone()
+    return row
+
+
+def revoke_source(conn, source_id, status="revoked"):
+    conn.execute(
+        "UPDATE sources SET status=?, revoked_at=? WHERE id=?",
+        (status, timeutil.now_iso() if status == "revoked" else None, source_id),
+    )
+
+
+def reactivate_source(conn, source_id):
+    conn.execute(
+        "UPDATE sources SET status='active', revoked_at=NULL WHERE id=?", (source_id,))
+
+
+def revoke_source_credentials(conn, source_id):
+    """Revoke every outstanding key for a source, e.g. to rotate them."""
+    cur = conn.execute(
+        "UPDATE source_credentials SET revoked_at=? WHERE source_id=? AND revoked_at IS NULL",
+        (timeutil.now_iso(), source_id),
+    )
+    return cur.rowcount
+
+
+def count_sources(conn, status="active"):
+    return conn.execute(
+        "SELECT COUNT(*) c FROM sources WHERE status=?", (status,)).fetchone()["c"]

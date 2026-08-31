@@ -7,6 +7,8 @@ with enterprise identity management and hardware-backed MFA.
 """
 from . import crypto_utils, db, models
 
+DEMO_SOURCE_KEY = "demo-simulator"
+
 DEMO_USERS = [
     ("officer1", "Requester#2026!", "requester"),
     ("supervisor1", "Approver#2026!", "approver"),
@@ -27,9 +29,11 @@ def seed(db_path=None):
             created.append((username, password, role, secret))
 
         api_key = None
-        if not models.has_api_key(conn):
-            api_key = crypto_utils.new_token(24)
-            models.create_api_key(conn, api_key, "default-sensor-key")
+        if models.get_source_by_key(conn, DEMO_SOURCE_KEY) is None:
+            source_id = models.create_source(
+                conn, DEMO_SOURCE_KEY, "Demo simulator feed",
+                adapter="justikey", operator="local-demo")
+            api_key = models.issue_source_credential(conn, source_id, "initial")
 
         return created, api_key
     finally:
