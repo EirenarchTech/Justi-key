@@ -9,7 +9,7 @@ recomputes the chain directly against the SQLite file.
 import hashlib
 import json
 
-from . import config, timeutil
+from . import anchor, config, timeutil
 
 # Re-exported so existing callers keep working; canonical UTC formatting
 # lives in timeutil.
@@ -49,6 +49,9 @@ def append_event(conn, event_type, actor, details=None):
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    # Publish a checkpoint once enough entries have accrued. Done after the
+    # commit so an anchor only ever attests to durable state.
+    anchor.maybe_anchor(conn)
     return seq, entry_hash
 
 

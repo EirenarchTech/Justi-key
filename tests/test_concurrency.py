@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from justikey import audit, db, models
+from justikey import anchor, audit, db, models
 
 
 class TestConcurrentAuditAppend(unittest.TestCase):
@@ -22,9 +22,11 @@ class TestConcurrentAuditAppend(unittest.TestCase):
         db.init_db(self.path)
 
     def tearDown(self):
-        for suffix in ("", "-wal", "-shm"):
+        base = self.path[:-3] if self.path.endswith(".db") else self.path
+        for path in (self.path, self.path + "-wal", self.path + "-shm",
+                     base + ".anchors.jsonl", base + ".anchor-key"):
             try:
-                os.remove(self.path + suffix)
+                os.remove(path)
             except OSError:
                 pass
 
@@ -53,12 +55,17 @@ class TestConcurrentAuditAppend(unittest.TestCase):
         try:
             count = conn.execute("SELECT COUNT(*) c FROM audit_log").fetchone()["c"]
             ok, info, reason = audit.verify_chain(conn)
+            # Automatic anchoring runs off these same appends, so the anchor
+            # chain has to survive concurrent creation too.
+            store = anchor.AnchorStore.for_connection(conn)
+            anchor_result = anchor.verify_anchors(conn, store)
         finally:
             conn.close()
 
         self.assertEqual(errors, [])
         self.assertEqual(count, threads_count * per_thread)
         self.assertTrue(ok, reason)
+        self.assertTrue(anchor_result["ok"], anchor_result["message"])
 
     def test_verify_detects_a_gap_even_when_links_still_hash(self):
         conn = db.get_connection(self.path)

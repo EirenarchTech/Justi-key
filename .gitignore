@@ -2,4 +2,12 @@ __pycache__/
 *.pyc
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 .venv/
+
+# Audit anchoring artifacts. The signing key must never be committed --
+# publishing it would let anyone forge checkpoints and defeat the control.
+*.anchor-key
+*.anchors.jsonl
+witness.jsonl

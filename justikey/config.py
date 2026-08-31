@@ -29,6 +29,32 @@ COOKIE_SECURE = os.environ.get("JUSTIKEY_COOKIE_SECURE", "0") == "1"
 # Genesis hash for the audit hash chain (seq 0, no prior entry).
 GENESIS_HASH = "0" * 64
 
+# --- Audit anchoring -------------------------------------------------------
+# A hash chain cannot detect truncation of its own tail: deleting the most
+# recent entries leaves a shorter but perfectly valid chain. Anchoring
+# publishes signed checkpoints of the chain head to storage the database
+# cannot reach, so a missing tail becomes provable.
+#
+# Leave these unset to derive the anchor log and key from the database path
+# (justikey.db -> justikey.anchors.jsonl, justikey.anchor-key). Setting them
+# explicitly is how a real deployment puts the anchor log on separate
+# storage and the key in a secrets manager.
+ANCHOR_PATH = os.environ.get("JUSTIKEY_ANCHOR_PATH") or None
+ANCHOR_KEY_FILE = os.environ.get("JUSTIKEY_ANCHOR_KEY_FILE") or None
+# Hex-encoded key supplied directly, so the signing key never has to touch
+# this host's disk. Takes precedence over the key file.
+ANCHOR_KEY_HEX = os.environ.get("JUSTIKEY_ANCHOR_KEY") or None
+
+# Write a checkpoint every N audit entries. 0 disables automatic anchoring
+# (anchors can still be created on demand from the CLI or the audit page).
+ANCHOR_INTERVAL_ENTRIES = int(os.environ.get("JUSTIKEY_ANCHOR_INTERVAL", 25))
+
+# Optional independent witness. Anchors are also POSTed here, to a service
+# outside this application's trust domain -- the control that actually makes
+# tail truncation undeniable. See scripts/witness_server.py.
+WITNESS_URL = os.environ.get("JUSTIKEY_WITNESS_URL") or None
+WITNESS_TIMEOUT_SECONDS = float(os.environ.get("JUSTIKEY_WITNESS_TIMEOUT", 5.0))
+
 INGEST_API_KEY_HEADER = "X-API-Key"
 
 SESSION_COOKIE_NAME = "jk_session"

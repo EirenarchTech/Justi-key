@@ -30,6 +30,14 @@ python3 scripts/simulator.py --api-key <printed-by-run_server> --count 30
 # 3. Open http://127.0.0.1:8080/login in a browser
 ```
 
+Optionally run an independent audit witness alongside it, so deletion of the
+audit tail becomes provable rather than merely suspected:
+
+```bash
+python3 scripts/witness_server.py --port 8090 --store witness.jsonl
+JUSTIKEY_WITNESS_URL=http://127.0.0.1:8090 python3 scripts/run_server.py --port 8080
+```
+
 The first `run_server.py` run prints demo credentials to the console:
 
 | role       | username     | password          | purpose                              |
@@ -63,16 +71,20 @@ Use `--reset` to wipe the database and start over: `python3 scripts/run_server.p
    plate, a stale/expired authorization, or an authorization belonging to
    someone else is denied and logged.
 5. `auditor1` signs in and can review every event in the hash-chained audit
-   ledger, and run an integrity check from the UI or the command line:
+   ledger, publish a checkpoint of the ledger head, and run an integrity
+   check from the UI or the command line:
 
 ```bash
 python3 scripts/verify_audit.py justikey.db
+python3 scripts/verify_audit.py justikey.db --witness http://127.0.0.1:8090
 ```
 
-`verify_audit.py` deliberately re-implements the hash-chain check from
-scratch against the raw SQLite file, rather than importing the server's own
-audit module — an independent verifier, not a callback into the code that
-wrote the ledger.
+`verify_audit.py` deliberately re-implements every check from scratch
+against the raw stored files, rather than importing the server's own audit
+module — an independent verifier, not a callback into the code that wrote
+the ledger. It reports three layers: the hash chain, the local anchor log,
+and an independent witness (see
+[External anchoring](#external-anchoring-closing-the-tail-truncation-gap)).
 
 ## Architecture
 
@@ -83,16 +95,19 @@ justikey/
   crypto_utils.py  PBKDF2 password hashing, RFC 6238 TOTP, session tokens
   audit.py       hash-chained audit ledger (append + verify)
   models.py      data access: users, sessions, events, authorizations
+  anchor.py      signed checkpoints making tail truncation detectable
   policy.py      disclosure policy engine — the only path to protected data
   templates.py   minimal HTML templating (all interpolation is escaped)
   webapp.py      http.server-based router, auth flow, CSRF, all routes
   seed.py        deterministic demo accounts + sensor API key
 
 scripts/
-  run_server.py    start the app (seeds demo data on first run)
-  simulator.py     synthetic ALPR observation generator (no camera needed)
-  show_totp.py     dev helper: current TOTP code for a demo account
-  verify_audit.py  independent CLI audit-chain verifier
+  run_server.py     start the app (seeds demo data on first run)
+  simulator.py      synthetic ALPR observation generator (no camera needed)
+  show_totp.py      dev helper: current TOTP code for a demo account
+  anchor_audit.py   publish a checkpoint of the ledger head on demand
+  witness_server.py independent witness holding its own copy of checkpoints
+  verify_audit.py   independent verifier: chain + anchors + witness
 
 tests/
   test_totp.py        TOTP + password hashing correctness
@@ -101,6 +116,8 @@ tests/
   test_policy.py      disclosure policy: ownership, approval, expiry, plate match
   test_timeutil.py    canonical timestamps; window filtering across vendor formats
   test_concurrency.py no audit entry lost under concurrent append; atomic approval
+  test_anchor.py      truncation, rewrite, and forged-anchor detection
+  test_verify_cli.py  the standalone verifier's own reimplementation of the checks
 ```
 
 ### Core principle: collection is not access
@@ -171,11 +188,91 @@ the ledger exists to keep. Verification also checks for sequence gaps, not
 just hash continuity, since removing a whole entry leaves the remaining
 links internally consistent.
 
-**Known limitation:** a hash chain cannot detect truncation of its own
-tail. Deleting the most recent N entries leaves a shorter but perfectly
-valid chain. Detecting that requires an anchor outside the database — a
-countersigned checkpoint, WORM storage, or an external witness — which is
-listed below as production work.
+### External anchoring: closing the tail-truncation gap
+
+A hash chain proves no entry was *modified*, but not that none was *removed
+from the end*. Deleting the newest entries leaves a shorter chain that
+still verifies perfectly — so the record an attacker most wants to erase,
+the one covering what they just did, is exactly the one the chain alone
+cannot protect.
+
+Anchoring closes that gap by periodically publishing a signed checkpoint of
+the chain head (`justikey/anchor.py`). Verification then compares the ledger
+against the highest checkpoint: a ledger shorter than something already
+witnessed proves entries were deleted.
+
+Each checkpoint carries two values. `hash` is a plain SHA-256 over its
+fields, so anyone can check that checkpoints link together and match the
+ledger without holding any secret. `mac` is an HMAC-SHA256 proving the
+checkpoint was issued by this system and not forged by whoever rewrote the
+ledger. Checkpoints chain to each other too, so one cannot be quietly
+removed from the middle.
+
+Checkpoints go to two places, and **they are not equally strong**:
+
+| destination | protects against | defeated by |
+|---|---|---|
+| local anchor log (`*.anchors.jsonl`) | deleting ledger rows | an attacker who also rewrites the log and holds the signing key |
+| independent witness (`scripts/witness_server.py`) | deleting ledger rows *and* rewriting the local log | nothing the JustiKey host alone can do |
+
+The witness is the control that actually works against a host-level
+adversary, because its records are out of reach. Run one and point JustiKey
+at it:
+
+```bash
+python3 scripts/witness_server.py --port 8090 --store witness.jsonl
+JUSTIKEY_WITNESS_URL=http://127.0.0.1:8090 python3 scripts/run_server.py
+```
+
+The witness only appends. It accepts an identical re-submission but returns
+409 on a *different* checkpoint at a sequence it already holds, so history
+cannot be quietly replaced.
+
+Anchors are written automatically every `JUSTIKEY_ANCHOR_INTERVAL` entries
+(default 25), on demand from the audit page, or from cron:
+
+```bash
+python3 scripts/anchor_audit.py --db justikey.db --witness http://127.0.0.1:8090
+```
+
+Verification reports all three layers:
+
+```bash
+python3 scripts/verify_audit.py justikey.db --witness http://127.0.0.1:8090
+```
+
+Deleting the last 8 entries produces exactly the split the design predicts —
+the chain sees nothing wrong, the anchors prove what is missing:
+
+```
+  chain   : OK, 22 entries, no tampering detected
+  anchors : FAILED: ledger ends at seq=22 but seq=30 was already anchored:
+            8 entries have been removed
+  witness : FAILED: ledger ends at seq=22 but seq=30 was already anchored:
+            8 entries have been removed
+```
+
+**Key custody is what makes this real.** By default the signing key is
+generated beside the database, which an attacker who can rewrite the ledger
+can usually also read — that fallback raises the bar but does not hold
+against host compromise. Supply the key out of band so it never touches the
+host, and give auditors their own copy:
+
+```bash
+JUSTIKEY_ANCHOR_KEY=$(openssl rand -hex 32) python3 scripts/run_server.py
+```
+
+With the key held independently, an attacker who deletes the tail *and*
+forges a replacement anchor log is caught on both counts: the forged log
+fails signature verification, and the witness proves the deletion.
+
+**Remaining limitation:** anchoring bounds how much can be erased
+undetected, it does not reduce it to zero. Entries written since the last
+checkpoint are still truncatable without contradiction, so the interval sets
+the exposure window. Shorten it, and treat the audit page's "entries since
+last checkpoint" figure as the live measure of that gap. Production should
+additionally use asymmetric signatures (so verifiers need only a public key)
+and anchor to WORM storage or a public transparency log.
 
 ## Running the tests
 
@@ -194,8 +291,9 @@ not implement (and a production JustiKey should add):
 - Enterprise identity, hardware-backed MFA, FIDO2/WebAuthn, or CAC/PIV in
   place of the deterministic demo accounts.
 - Cryptographically signed/verified warrant documents.
-- Externally anchored or WORM audit storage (see the tail-truncation
-  limitation above).
+- Asymmetric anchor signatures and WORM or transparency-log anchoring (the
+  prototype ships HMAC checkpoints plus an independent witness; see the
+  anchoring section above).
 - Rate limiting and lockout on the login and ingest endpoints. Nothing here
   throttles password guessing, and a caller with a bad API key can still
   drive audit writes.

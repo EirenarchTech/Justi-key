@@ -20,7 +20,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import audit, config, crypto_utils, db, models, policy, templates, timeutil
+from . import anchor, audit, config, crypto_utils, db, models, policy, templates, timeutil
 
 SESSION_COOKIE = config.SESSION_COOKIE_NAME
 PENDING_COOKIE = config.PENDING_COOKIE_NAME
@@ -767,30 +767,101 @@ def audit_view(h):
 <div class="card"><h2>Audit ledger</h2>
 <p class="hint">Most recent 300 entries. Each entry's hash incorporates the previous entry's hash,
 forming a tamper-evident chain.</p>
-<p><a href="/audit/verify"><button class="secondary">Verify chain integrity</button></a></p>
+<div class="actions">
+<a href="/audit/verify"><button class="secondary">Verify integrity</button></a>
+<form method="post" action="/audit/anchor" class="inline">
+{templates.csrf_field(h.session_row['csrf_token'])}
+<button type="submit" class="secondary">Anchor ledger head now</button>
+</form>
+</div>
+{_anchor_status_html(h)}
 {table}
 </div>
 """
     h._send_html(200, h._page("Audit ledger", body))
 
 
+def _anchor_status_html(h):
+    """Show how current the published checkpoints are.
+
+    Anchoring failures are deliberately non-fatal to audit writes, so the
+    backlog has to be visible somewhere or a persistent failure would go
+    unnoticed -- the exact silent-failure mode anchoring exists to remove.
+    """
+    store = anchor.AnchorStore.for_connection(h.conn, create_key=False)
+    if store is None:
+        return ('<p class="hint">Anchoring is not configured for this database, so '
+                'truncation of the ledger tail would not be detectable.</p>')
+    last = store.last()
+    if last is None:
+        return ('<p class="hint">No checkpoints published yet. Until one exists, deleting the '
+                'most recent entries would leave a shorter chain that still verifies.</p>')
+    behind = anchor.entries_since_last_anchor(h.conn, store)
+    witness = f" Witness: <code>{templates.escape(config.WITNESS_URL)}</code>." if config.WITNESS_URL else \
+              " No external witness configured."
+    return (f'<p class="hint">Last checkpoint: anchor #{last["anchor_seq"]} at audit seq='
+            f'{last["audit_seq"]} ({templates.escape(last["created_at"][:19])}); '
+            f'{behind} entr{"y" if behind == 1 else "ies"} since.{witness}</p>')
+
+
+@route("POST", "/audit/anchor")
+def audit_anchor(h):
+    user = h._require_login(roles=["auditor"])
+    form = h._parse_form()
+    h._check_csrf(form)
+    store = anchor.AnchorStore.for_connection(h.conn)
+    if store is None:
+        raise HttpError(400, "Anchoring is not configured for this database.")
+    record = anchor.create_anchor(h.conn, store)
+    if record is None:
+        raise Redirect("/audit")
+    audit.append_event(h.conn, "audit_anchored", user["username"], {
+        "anchor_seq": record["anchor_seq"], "audit_seq": record["audit_seq"],
+    })
+    h._redirect("/audit")
+
+
 @route("GET", "/audit/verify")
 def audit_verify(h):
     h._require_login(roles=["auditor"])
-    ok, info, reason = audit.verify_chain(h.conn)
-    if ok:
-        body = f'<div class="card"><h2>Audit chain verification</h2>' \
-               f'<p class="success">OK &mdash; {info} entries verified, no tampering detected.</p>' \
-               f'<p class="hint">You can also verify independently from the command line with ' \
-               f'<code>python scripts/verify_audit.py</code>, which recomputes the chain directly ' \
-               f'from the database file without going through this application.</p>' \
-               f'<p><a href="/audit">Back to audit log</a></p></div>'
-        h._send_html(200, h._page("Audit verification", body))
+
+    chain_ok, info, reason = audit.verify_chain(h.conn)
+    if chain_ok:
+        chain_html = (f'<p class="success">Chain: OK &mdash; {info} entries verified, '
+                      f'no entry has been modified or removed from the interior.</p>')
     else:
-        body = f'<div class="card"><h2>Audit chain verification</h2>' \
-               f'<p class="error">FAILED at entry seq={info}: {templates.escape(reason)}</p>' \
-               f'<p><a href="/audit">Back to audit log</a></p></div>'
-        h._send_html(200, h._page("Audit verification", body))
+        chain_html = (f'<p class="error">Chain: FAILED at entry seq={info}: '
+                      f'{templates.escape(reason)}</p>')
+
+    store = anchor.AnchorStore.for_connection(h.conn, create_key=False)
+    if store is None:
+        anchor_html = ('<p class="error">Anchors: unavailable. Without published checkpoints, '
+                       'truncation of the ledger tail cannot be detected.</p>')
+        anchors_ok = False
+    else:
+        result = anchor.verify_anchors(h.conn, store)
+        cls = "success" if result["ok"] else "error"
+        label = "OK" if result["ok"] else f"FAILED ({result['status']})"
+        anchor_html = (f'<p class="{cls}">Anchors: {label} &mdash; '
+                       f'{templates.escape(result["message"])}</p>')
+        anchors_ok = result["ok"]
+
+    verdict = ('<p>The ledger is intact.</p>' if chain_ok and anchors_ok else
+               '<p><strong>This ledger has failed verification and must be treated as '
+               'unreliable pending investigation.</strong></p>')
+
+    body = f"""<div class="card"><h2>Audit integrity verification</h2>
+{chain_html}
+{anchor_html}
+{verdict}
+<p class="hint">The chain proves no entry was altered. The anchors prove none were deleted from
+the end &mdash; a check the chain cannot make on its own, since removing the newest entries leaves
+a shorter chain that still verifies. Verify independently from the command line with
+<code>python scripts/verify_audit.py --witness &lt;url&gt;</code>, which recomputes everything
+directly from the stored files and can compare against a witness this application does not
+control.</p>
+<p><a href="/audit">Back to audit log</a></p></div>"""
+    h._send_html(200, h._page("Audit verification", body))
 
 
 # ===========================================================================
