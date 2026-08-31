@@ -30,6 +30,34 @@ MAX_BATCH_OBSERVATIONS = int(os.environ.get("JUSTIKEY_MAX_BATCH", 500))
 # Only set JUSTIKEY_COOKIE_SECURE=1 when serving over HTTPS (production).
 COOKIE_SECURE = os.environ.get("JUSTIKEY_COOKIE_SECURE", "0") == "1"
 
+# --- Encryption at rest ----------------------------------------------------
+# Protected observation fields (plate, location) and TOTP secrets are stored
+# as AES-256-GCM ciphertext. Supply the key out of band so possession of the
+# database alone does not recover plate history; the generated key file is a
+# development fallback only.
+DATA_KEY_HEX = os.environ.get("JUSTIKEY_DATA_KEY") or None
+# New databases are encrypted unless this is explicitly disabled.
+ENCRYPT_AT_REST = os.environ.get("JUSTIKEY_ENCRYPT_AT_REST", "1") == "1"
+
+# --- Scope and retention limits --------------------------------------------
+# Widest time window an authorization may request. The approver is expected
+# to judge proportionality, but "not unnecessarily broad" should be enforced
+# by software rather than left entirely to policy.
+MAX_WINDOW_DAYS = int(os.environ.get("JUSTIKEY_MAX_WINDOW_DAYS", 90))
+
+# Times one approved authorization may be used before it must be re-approved.
+# 0 disables the cap.
+MAX_DISCLOSURES_PER_AUTHORIZATION = int(os.environ.get("JUSTIKEY_MAX_DISCLOSURES", 25))
+
+# Observations older than this are purged by scripts/enforce_retention.py.
+# Indefinite retention of location history is itself the harm this system
+# exists to limit. 0 disables automatic purging.
+RETENTION_DAYS = int(os.environ.get("JUSTIKEY_RETENTION_DAYS", 365))
+
+# --- Brute-force resistance ------------------------------------------------
+MAX_FAILED_LOGINS = int(os.environ.get("JUSTIKEY_MAX_FAILED_LOGINS", 5))
+LOCKOUT_SECONDS = int(os.environ.get("JUSTIKEY_LOCKOUT_SECONDS", 900))
+
 # Genesis hash for the audit hash chain (seq 0, no prior entry).
 GENESIS_HASH = "0" * 64
 

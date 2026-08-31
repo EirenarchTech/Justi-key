@@ -44,6 +44,21 @@ def now_iso():
     return to_canonical(now())
 
 
+def parse_dt(value):
+    """Parse an ISO-8601-ish string into an aware UTC datetime."""
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be a string")
+    text = value.strip()
+    if not text:
+        raise ValueError("timestamp must not be empty")
+    if text[-1] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def parse(value):
     """Parse an ISO-8601-ish string into a canonical UTC string.
 
@@ -58,6 +73,4 @@ def parse(value):
     text = value.strip()
     if not text:
         raise ValueError("timestamp must not be empty")
-    if text[-1] in ("Z", "z"):
-        text = text[:-1] + "+00:00"
-    return to_canonical(datetime.fromisoformat(text))
+    return to_canonical(parse_dt(text))

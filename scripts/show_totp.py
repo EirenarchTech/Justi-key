@@ -21,12 +21,13 @@ def main():
     conn = db.get_connection()
     try:
         user = models.get_user_by_username(conn, sys.argv[1])
+        if not user:
+            print(f"no such user: {sys.argv[1]}")
+            sys.exit(1)
+        secret = models.totp_secret_for(conn, user)
     finally:
         conn.close()
-    if not user:
-        print(f"no such user: {sys.argv[1]}")
-        sys.exit(1)
-    print(crypto_utils.totp_now(user["totp_secret"]))
+    print(crypto_utils.totp_now(secret))
 
 
 if __name__ == "__main__":

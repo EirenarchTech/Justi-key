@@ -9,6 +9,7 @@ server is threaded, so a busy timeout is set to make concurrent writers
 wait for the write lock instead of failing outright.
 """
 import sqlite3
+import sys
 
 from . import config
 
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     salt TEXT NOT NULL,
     totp_secret TEXT NOT NULL,
+    totp_secret_ct TEXT,
     role TEXT NOT NULL CHECK(role IN ('requester', 'approver', 'auditor')),
     created_at TEXT NOT NULL
 );
@@ -60,6 +62,13 @@ CREATE TABLE IF NOT EXISTS lpr_events (
     -- format it arrived in. These are the trustworthy provenance fields.
     source_ref INTEGER REFERENCES sources(id),
     adapter TEXT,
+    -- Encrypted-at-rest columns. plate_index is a keyed HMAC enabling exact
+    -- lookup without holding plaintext; plate_ct/location_ct hold the
+    -- AES-256-GCM ciphertext. When encryption is on, plate and location are
+    -- NULL and these carry the data.
+    plate_index TEXT,
+    plate_ct TEXT,
+    location_ct TEXT,
     ingested_at TEXT NOT NULL
 );
 -- The index on source_ref is created by migrate(), not here: on an existing
@@ -87,7 +96,8 @@ CREATE TABLE IF NOT EXISTS authorizations (
     approved_by INTEGER REFERENCES users(id),
     approved_at TEXT,
     approval_expires_at TEXT,
-    denial_reason TEXT
+    denial_reason TEXT,
+    disclosure_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_auth_requested_by ON authorizations(requested_by);
 CREATE INDEX IF NOT EXISTS idx_auth_status ON authorizations(status);
@@ -135,6 +145,20 @@ CREATE TABLE IF NOT EXISTS source_credentials (
     revoked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_source_credentials_source ON source_credentials(source_id);
+
+-- Per-database settings: encryption mode and the key-check canary.
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Failed sign-in attempts, for lockout. Cleared on a successful sign-in.
+CREATE TABLE IF NOT EXISTS login_failures (
+    username TEXT PRIMARY KEY,
+    failures INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT,
+    last_failure_at TEXT NOT NULL
+);
 """
 
 # Columns added to lpr_events after the original schema shipped. Applied by
@@ -144,11 +168,40 @@ EVENT_COLUMNS = (
     ("source_ref", "INTEGER REFERENCES sources(id)"),
     # Which payload format this observation arrived in.
     ("adapter", "TEXT"),
+    # Encryption-at-rest columns (see crypto_store).
+    ("plate_index", "TEXT"),
+    ("plate_ct", "TEXT"),
+    ("location_ct", "TEXT"),
+)
+
+AUTHORIZATION_COLUMNS = (
+    # How many disclosures this authorization has already produced, so a
+    # single approval cannot be replayed indefinitely inside its window.
+    ("disclosure_count", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+USER_COLUMNS = (
+    ("totp_secret_ct", "TEXT"),
 )
 
 
+class Connection(sqlite3.Connection):
+    """sqlite3.Connection that can carry per-database state.
+
+    The base class is a C type with no instance dict, so the field cipher and
+    the database path -- both needed wherever protected columns are read or
+    written -- have nowhere to live without subclassing.
+    """
+    db_path = None
+    _cipher = None
+    _cipher_loaded = False
+
+
 def get_connection(db_path=None):
-    conn = sqlite3.connect(db_path or config.DB_PATH, timeout=config.SQLITE_BUSY_TIMEOUT_SECONDS)
+    path = db_path or config.DB_PATH
+    conn = sqlite3.connect(path, timeout=config.SQLITE_BUSY_TIMEOUT_SECONDS,
+                           factory=Connection)
+    conn.db_path = path
     conn.row_factory = sqlite3.Row
     # Autocommit: transactions are opened explicitly where atomicity matters.
     conn.isolation_level = None
@@ -163,12 +216,17 @@ def get_connection(db_path=None):
 
 def migrate(conn):
     """Apply additive schema changes to an existing database."""
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(lpr_events)")}
-    for column, decl in EVENT_COLUMNS:
-        if column not in existing:
-            conn.execute(f"ALTER TABLE lpr_events ADD COLUMN {column} {decl}")
+    for table, columns in (("lpr_events", EVENT_COLUMNS),
+                           ("authorizations", AUTHORIZATION_COLUMNS),
+                           ("users", USER_COLUMNS)):
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, decl in columns:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_source_ref ON lpr_events(source_ref)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_plate_index ON lpr_events(plate_index, captured_at)")
 
     # Keys issued before per-source identity existed still work, but are now
     # attributed to an explicit legacy source rather than to whatever name a
@@ -203,5 +261,31 @@ def init_db(db_path=None):
     try:
         conn.executescript(SCHEMA)
         migrate(conn)
+        _enable_encryption_if_appropriate(conn)
     finally:
         conn.close()
+
+
+def _enable_encryption_if_appropriate(conn):
+    """Turn on encryption at rest for a database that can safely adopt it.
+
+    Only a database with no existing plaintext observations is switched
+    automatically. One that already holds plaintext needs a deliberate,
+    audited migration (scripts/encrypt_store.py) rather than silently ending
+    up half encrypted, which would be worse than either state.
+    """
+    from . import crypto_store
+    if not config.ENCRYPT_AT_REST or not crypto_store.CRYPTOGRAPHY_AVAILABLE:
+        return
+    if conn.db_path in (None, "", ":memory:"):
+        return
+    if crypto_store.encryption_mode(conn) != crypto_store.MODE_NONE:
+        return
+    plaintext_rows = conn.execute(
+        "SELECT COUNT(*) c FROM lpr_events WHERE plate <> ''").fetchone()["c"]
+    if plaintext_rows:
+        print(f"[justikey] {plaintext_rows} unencrypted observation(s) present; "
+              f"run scripts/encrypt_store.py to migrate before encryption is enabled.",
+              file=sys.stderr)
+        return
+    crypto_store.enable_encryption(conn, conn.db_path)

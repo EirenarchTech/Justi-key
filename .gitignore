@@ -16,3 +16,6 @@ witness.jsonl
 edge_buffer.jsonl
 edge_processed.json
 captures/
+
+# Data-encryption key. Committing it would make encryption at rest pointless.
+*.data-key

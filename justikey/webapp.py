@@ -310,6 +310,15 @@ def login_submit(h):
     form = h._parse_form()
     username = (form.get("username") or "").strip()
     password = form.get("password") or ""
+
+    locked_for = models.login_lock_remaining(h.conn, username) if username else 0
+    if locked_for:
+        audit.append_event(h.conn, "login_blocked", username, {"locked_seconds": locked_for})
+        h._send_html(200, h._page("Sign in", LOGIN_FORM, error=(
+            f"Too many failed attempts. This account is locked for another "
+            f"{locked_for // 60 + 1} minute(s).")))
+        return
+
     user = models.get_user_by_username(h.conn, username)
     if user is None:
         # Spend the same PBKDF2 work as a real check so response time does
@@ -319,9 +328,13 @@ def login_submit(h):
     else:
         ok = crypto_utils.verify_password(password, user["salt"], user["password_hash"])
     if not ok:
-        audit.append_event(h.conn, "login_failed", username or "(blank)", {"reason": "bad_credentials"})
+        failures, locked = (models.record_login_failure(h.conn, username)
+                            if username else (0, 0))
+        audit.append_event(h.conn, "login_failed", username or "(blank)", {
+            "reason": "bad_credentials", "failures": failures, "locked_seconds": locked})
         h._send_html(200, h._page("Sign in", LOGIN_FORM, error="Invalid username or password."))
         return
+    models.clear_login_failures(h.conn, username)
     token = models.create_pending_session(h.conn, user["id"])
     h._redirect("/login/totp", cookies=[build_set_cookie(PENDING_COOKIE, token, config.PENDING_LOGIN_LIFETIME_SECONDS)])
 
@@ -511,6 +524,18 @@ def new_authorization_submit(h):
     if window_end <= window_start:
         body = NEW_AUTH_FORM % templates.csrf_field(h.session_row["csrf_token"])
         h._send_html(200, h._page("New request", body, error="Window end must be after window start."))
+        return
+    within_limit, max_days = policy.check_window_breadth(window_start, window_end)
+    if not within_limit:
+        span = policy.window_days(window_start, window_end)
+        audit.append_event(h.conn, "authorization_refused", user["username"], {
+            "reason": "window_too_broad", "requested_days": round(span, 1),
+            "max_days": max_days})
+        body = NEW_AUTH_FORM % templates.csrf_field(h.session_row["csrf_token"])
+        h._send_html(200, h._page("New request", body, error=(
+            f"The requested window spans {span:.0f} days; the maximum is {max_days}. "
+            f"Narrow the period, or raise it in policy if the investigation "
+            f"genuinely requires more.")))
         return
 
     auth_id = models.create_authorization(
@@ -720,8 +745,10 @@ def search_submit(h):
         h._send_html(200, h._page("Search denied", body, error=message))
         return
 
+    used = models.record_disclosure(h.conn, auth_id)
     audit.append_event(h.conn, "disclosure", user["username"], {
-        "authorization_id": auth_id, "target_plate": plate.strip().upper(), "record_count": len(events),
+        "authorization_id": auth_id, "target_plate": plate.strip().upper(),
+        "record_count": len(events), "disclosures_used": used,
     })
     trs = "".join(f"""<tr>
 <td>{templates.escape(e['captured_at'][:19])}</td>
@@ -745,7 +772,11 @@ def search_submit(h):
 
 @route("GET", "/audit")
 def audit_view(h):
-    h._require_login(roles=["auditor"])
+    user = h._require_login(roles=["auditor"])
+    # Oversight access is itself sensitive: the ledger names every plate that
+    # was ever investigated. Reading it must leave a trace, or the one role
+    # able to see everything is the one role nobody can review.
+    audit.append_event(h.conn, "audit_log_viewed", user["username"], {})
     rows = h.conn.execute(
         "SELECT seq, timestamp, event_type, actor, details, hash FROM audit_log ORDER BY seq DESC LIMIT 300"
     ).fetchall()
@@ -820,7 +851,8 @@ def audit_anchor(h):
 
 @route("GET", "/audit/verify")
 def audit_verify(h):
-    h._require_login(roles=["auditor"])
+    user = h._require_login(roles=["auditor"])
+    audit.append_event(h.conn, "audit_verified", user["username"], {})
 
     chain_ok, info, reason = audit.verify_chain(h.conn)
     if chain_ok:

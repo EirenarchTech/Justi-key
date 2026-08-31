@@ -1,0 +1,8 @@
+# JustiKey runs on the Python standard library alone, with one exception.
+#
+# Encryption at rest for protected observation data needs a vetted AES-256-GCM
+# implementation, and hand-rolling a cipher for a product whose credibility
+# rests on privacy claims would be a bad trade. Without this package the
+# application still runs, but set JUSTIKEY_ENCRYPT_AT_REST=0 and understand
+# that anyone holding the database file holds the plate history.
+cryptography>=41.0

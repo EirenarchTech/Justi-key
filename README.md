@@ -12,13 +12,14 @@ is created, **independently approved by a second authenticated person**,
 used within a narrow plate-and-time scope, and permanently recorded in a
 tamper-evident audit ledger.
 
-This repository is a runnable prototype of that architecture. It uses only
-the Python standard library — no third-party packages, no external
-services — so the whole workflow can be exercised on a laptop.
+This repository is a runnable prototype of that architecture. It runs on the
+Python standard library with a single dependency — `cryptography`, for
+AES-256-GCM encryption at rest — and no external services, so the whole
+workflow can be exercised on a laptop.
 
 ## Quickstart
 
-Requires Python 3.9+ and nothing else.
+Requires Python 3.9+ and `pip install -r requirements.txt`.
 
 ```bash
 # 1. Start the server (creates demo accounts + a sensor API key on first run)
@@ -97,6 +98,7 @@ justikey/
   models.py      data access: users, sessions, events, authorizations
   anchor.py      signed checkpoints making tail truncation detectable
   adapters.py    vendor payload translation into one canonical observation
+  crypto_store.py AES-256-GCM field encryption and keyed blind index
   policy.py      disclosure policy engine — the only path to protected data
   templates.py   minimal HTML templating (all interpolation is escaped)
   webapp.py      http.server-based router, auth flow, CSRF, all routes
@@ -110,6 +112,8 @@ scripts/
   witness_server.py independent witness holding its own copy of checkpoints
   manage_sources.py register, rotate, suspend, and revoke sensor feeds
   edge_agent.py     device-side recognition with store-and-forward buffering
+  encrypt_store.py  migrate a plaintext database to encryption at rest
+  enforce_retention.py delete observations past their retention period
   verify_audit.py   independent verifier: chain + anchors + witness
 
 tests/
@@ -124,6 +128,119 @@ tests/
   test_sources.py     authenticated provenance, revocation isolation, migration
   test_adapters.py    vendor translation, timestamps, confidence, candidates
   test_edge_agent.py  buffering, once-only recognition, recognizer parsing
+  test_encryption.py  plaintext absent from disk, AAD binding, key handling
+  test_enforcement.py scope breadth, disclosure caps, lockout, retention
+```
+
+## Encryption at rest
+
+Every other control in JustiKey governs *access*: who asked, who approved,
+how narrow the scope was. None of them help if someone simply takes the
+database file. A stolen backup, a decommissioned disk, or a copied volume
+would yield the entire location history with no authorization, no approval,
+and no audit entry -- defeating every control at once.
+
+Plate and location values, and TOTP secrets, are therefore stored as
+AES-256-GCM ciphertext (`justikey/crypto_store.py`). Exact-plate search still
+works because each observation also carries a **blind index**: a keyed HMAC
+of the normalized plate. Lookups match on the index, so the query never
+handles plaintext; values are decrypted only for rows the policy engine has
+already authorized.
+
+Two keys, derived from one root by HKDF with distinct labels, so the index
+key can never decrypt and the encryption key can never build lookup values:
+
+```
+root ─┬─ HKDF("justikey:field-encryption:v1") → AES-256-GCM key
+      └─ HKDF("justikey:blind-index:v1")      → HMAC-SHA256 index key
+```
+
+Each ciphertext is bound by AAD to its capture time and camera, so someone
+with write access to the database cannot move a plate ciphertext onto a
+different time to fabricate a sighting -- the tag check fails. A wrong key is
+detected at startup against a stored canary and refused, rather than silently
+writing records that can never be read back.
+
+### Key custody is the whole point
+
+A key sitting beside the database protects against a stolen file and nothing
+more. Supply it out of band so possession of the database alone is not
+enough:
+
+```bash
+JUSTIKEY_DATA_KEY=$(openssl rand -hex 32) python3 scripts/run_server.py
+```
+
+The generated `*.data-key` file is a development fallback and says so on
+stderr every time it is created.
+
+### Migrating an existing database
+
+A database created before encryption holds plaintext. `init_db` deliberately
+will **not** switch it over on its own -- a half-encrypted store is worse
+than either state, because callers cannot tell which rows are protected. The
+migration is explicit, transactional, and audited:
+
+```bash
+python3 scripts/encrypt_store.py --db justikey.db            # dry run
+python3 scripts/encrypt_store.py --db justikey.db --apply
+```
+
+Back up first, and be sure the key is one you will still have tomorrow.
+Losing it means losing every protected record; that is what encryption means,
+and it cuts both ways.
+
+### Residual exposure, stated plainly
+
+- **The blind index is deterministic.** An attacker holding the database can
+  tell that two rows concern the same (still unknown) vehicle and count how
+  often it was seen. That is inherent to searchable encryption; removing it
+  would mean giving up authorized lookup entirely.
+- **camera_id and captured_at stay plaintext.** They are needed to operate
+  the system and to bind the AAD. With the blind index they reveal movement
+  patterns of an unidentified vehicle, not its identity.
+- **A running server holds the key.** This protects data at rest, not against
+  a live host compromise.
+
+## Limits enforced in software, not policy
+
+The stated goal is to turn privacy requirements into enforceable
+architecture. These were previously human expectations only:
+
+| Control | Setting | Default |
+|---|---|---|
+| Maximum authorization time window | `JUSTIKEY_MAX_WINDOW_DAYS` | 90 days |
+| Disclosures per approval | `JUSTIKEY_MAX_DISCLOSURES` | 25 |
+| Failed sign-ins before lockout | `JUSTIKEY_MAX_FAILED_LOGINS` | 5 |
+| Lockout duration | `JUSTIKEY_LOCKOUT_SECONDS` | 900 |
+| Observation retention | `JUSTIKEY_RETENTION_DAYS` | 365 days |
+
+**Scope breadth.** A request spanning years is refused before anyone can
+approve it, and the limit is re-checked at disclosure time -- a check applied
+only at creation could be bypassed by any path that edits an authorization
+afterwards.
+
+**Disclosure cap.** One approval no longer authorizes unlimited re-querying
+inside its window.
+
+**Oversight is itself audited.** Reading the audit log and running an
+integrity check are recorded. The ledger names every plate ever
+investigated, so the one role able to see everything must not be the one role
+nobody can review.
+
+**Brute force.** PBKDF2's cost bounds an attacker's guess rate but never
+stops it; accounts now lock after repeated failures, and the lockout is
+audited.
+
+**Retention.** Indefinite retention of location history is itself the harm
+this system exists to limit, and deletion is the only control that gets
+stronger with time -- a record that no longer exists cannot be disclosed by a
+future compromise or a future policy change. Purges are audited, and audit
+entries outlive the data they describe.
+
+```bash
+python3 scripts/enforce_retention.py --db justikey.db            # dry run
+python3 scripts/enforce_retention.py --db justikey.db --apply    # from cron
 ```
 
 ## Integrating other LPR systems

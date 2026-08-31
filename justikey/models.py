@@ -1,7 +1,7 @@
 """Data-access layer: users, sessions, LPR events, and authorizations."""
 from datetime import timedelta
 
-from . import config, crypto_utils, timeutil
+from . import config, crypto_store, crypto_utils, timeutil
 
 
 # ---------------------------------------------------------------------------
@@ -11,12 +11,31 @@ from . import config, crypto_utils, timeutil
 def create_user(conn, username, password, role, totp_secret=None):
     pw_hash, salt = crypto_utils.hash_password(password)
     secret = totp_secret or crypto_utils.generate_totp_secret()
+    cipher = cipher_for(conn)
+    if cipher is None:
+        stored, secret_ct = secret, None
+    else:
+        # A TOTP secret is a standing credential: whoever reads it can mint
+        # valid second factors forever, so it must not sit in the clear.
+        stored, secret_ct = "", cipher.encrypt(secret, crypto_store.user_aad("totp_secret", username))
     cur = conn.execute(
-        "INSERT INTO users (username, password_hash, salt, totp_secret, role, created_at) "
-        "VALUES (?,?,?,?,?,?)",
-        (username, pw_hash, salt, secret, role, timeutil.now_iso()),
+        "INSERT INTO users (username, password_hash, salt, totp_secret, totp_secret_ct, "
+        "role, created_at) VALUES (?,?,?,?,?,?,?)",
+        (username, pw_hash, salt, stored, secret_ct, role, timeutil.now_iso()),
     )
     return cur.lastrowid
+
+
+def totp_secret_for(conn, user):
+    """Recover a user's TOTP secret, decrypting when stored encrypted."""
+    if user["totp_secret_ct"]:
+        cipher = cipher_for(conn)
+        if cipher is None:
+            raise crypto_store.EncryptionError(
+                "this user's TOTP secret is encrypted but no data key is available")
+        return cipher.decrypt(user["totp_secret_ct"],
+                              crypto_store.user_aad("totp_secret", user["username"]))
+    return user["totp_secret"]
 
 
 def get_user_by_username(conn, username):
@@ -44,7 +63,7 @@ def consume_totp(conn, user, code, purpose):
     captured code stays usable for its whole time step, so an approver
     could rubber-stamp several requests with one code.
     """
-    counter = crypto_utils.match_totp_counter(user["totp_secret"], code)
+    counter = crypto_utils.match_totp_counter(totp_secret_for(conn, user), code)
     if counter is None:
         return False
     # INSERT OR IGNORE against the (user, counter, purpose) primary key makes
@@ -113,30 +132,81 @@ def delete_session(conn, token):
 # LPR events (protected event store)
 # ---------------------------------------------------------------------------
 
+def cipher_for(conn):
+    """The field cipher for this database, or None when stored in the clear.
+
+    Cached on the connection: deriving subkeys per row would be wasteful, and
+    the key-check must not be re-run on every query.
+    """
+    if not conn._cipher_loaded:
+        conn._cipher = crypto_store.open_cipher(conn, conn.db_path or "")
+        conn._cipher_loaded = True
+    return conn._cipher
+
+
 def insert_event(conn, plate, captured_at, camera_id, confidence, location, source_id,
                  source_ref=None, adapter=None):
-    """Store an observation.
+    """Store an observation, encrypting the protected fields when enabled.
 
     `source_id` is the vendor's own label for the feed -- a claim carried in
     the payload. `source_ref` is the registered source that actually proved
     its identity with a credential. Only the latter is trustworthy, and it is
     what provenance and audit attribution use.
     """
+    captured_at = timeutil.parse(captured_at)
+    cipher = cipher_for(conn)
+    if cipher is None:
+        stored_plate, plate_index, plate_ct = plate, None, None
+        stored_location, location_ct = location, None
+    else:
+        # The legacy plate column keeps its NOT NULL constraint, so an
+        # encrypted row stores an empty string there and carries the real
+        # value in plate_ct. Empty means "look in the ciphertext column".
+        stored_plate, stored_location = "", None
+        plate_index = cipher.blind_index(plate)
+        plate_ct = cipher.encrypt(plate, crypto_store.event_aad("plate", captured_at, camera_id))
+        location_ct = cipher.encrypt(
+            location, crypto_store.event_aad("location", captured_at, camera_id))
+
     cur = conn.execute(
         "INSERT INTO lpr_events (plate, captured_at, camera_id, confidence, location, "
-        "source_id, source_ref, adapter, ingested_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (plate, timeutil.parse(captured_at), camera_id, confidence, location, source_id,
-         source_ref, adapter, timeutil.now_iso()),
+        "source_id, source_ref, adapter, plate_index, plate_ct, location_ct, ingested_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (stored_plate, captured_at, camera_id, confidence, stored_location, source_id,
+         source_ref, adapter, plate_index, plate_ct, location_ct, timeutil.now_iso()),
     )
     return cur.lastrowid
 
 
+def _reveal_event(cipher, row):
+    """Return an observation as a plain dict, decrypting if necessary."""
+    event = dict(row)
+    if cipher is not None and row["plate_ct"]:
+        event["plate"] = cipher.decrypt(
+            row["plate_ct"], crypto_store.event_aad("plate", row["captured_at"], row["camera_id"]))
+        event["location"] = cipher.decrypt(
+            row["location_ct"],
+            crypto_store.event_aad("location", row["captured_at"], row["camera_id"]))
+    return event
+
+
 def search_events(conn, plate, start, end):
-    return conn.execute(
-        "SELECT * FROM lpr_events WHERE plate=? AND captured_at>=? AND captured_at<=? "
-        "ORDER BY captured_at ASC",
-        (plate, start, end),
-    ).fetchall()
+    """Exact-plate lookup inside a time window.
+
+    Under encryption the match runs against the keyed blind index, so the
+    query never handles plaintext; values are decrypted only for the rows the
+    policy engine has already authorized.
+    """
+    cipher = cipher_for(conn)
+    if cipher is None:
+        rows = conn.execute(
+            "SELECT * FROM lpr_events WHERE plate=? AND captured_at>=? AND captured_at<=? "
+            "ORDER BY captured_at ASC", (plate, start, end)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM lpr_events WHERE plate_index=? AND captured_at>=? AND captured_at<=? "
+            "ORDER BY captured_at ASC", (cipher.blind_index(plate), start, end)).fetchall()
+    return [_reveal_event(cipher, r) for r in rows]
 
 
 def count_events(conn):
@@ -242,6 +312,20 @@ def _why_review_failed(conn, auth_id, approver_id, self_reason):
     return "not_pending"
 
 
+def record_disclosure(conn, auth_id):
+    """Count one use of an authorization.
+
+    Done as a single guarded UPDATE so concurrent searches cannot both slip
+    past the cap by reading the same count.
+    """
+    conn.execute(
+        "UPDATE authorizations SET disclosure_count = disclosure_count + 1 WHERE id=?",
+        (auth_id,))
+    row = conn.execute(
+        "SELECT disclosure_count FROM authorizations WHERE id=?", (auth_id,)).fetchone()
+    return row["disclosure_count"] if row else 0
+
+
 def count_pending_authorizations(conn):
     return conn.execute("SELECT COUNT(*) c FROM authorizations WHERE status='pending'").fetchone()["c"]
 
@@ -280,6 +364,51 @@ def verify_api_key(conn, key):
     return conn.execute(
         "SELECT 1 FROM api_keys WHERE key_hash=?", (crypto_utils.hash_token(key),)
     ).fetchone() is not None
+
+
+# ---------------------------------------------------------------------------
+# Brute-force resistance
+# ---------------------------------------------------------------------------
+
+def login_lock_remaining(conn, username):
+    """Seconds this account is locked for, or 0.
+
+    Without this, PBKDF2's cost is the only thing slowing an attacker down,
+    which bounds the guess rate but never stops it.
+    """
+    row = conn.execute(
+        "SELECT locked_until FROM login_failures WHERE username=?", (username,)).fetchone()
+    if not row or not row["locked_until"]:
+        return 0
+    now = timeutil.now()
+    locked_until = timeutil.parse_dt(row["locked_until"])
+    return max(0, int((locked_until - now).total_seconds()))
+
+
+def record_login_failure(conn, username):
+    """Count a failed sign-in, locking the account once the threshold is hit.
+
+    Returns (failures, locked_seconds).
+    """
+    now = timeutil.now()
+    row = conn.execute(
+        "SELECT failures FROM login_failures WHERE username=?", (username,)).fetchone()
+    failures = (row["failures"] if row else 0) + 1
+    locked_until = None
+    if config.MAX_FAILED_LOGINS > 0 and failures >= config.MAX_FAILED_LOGINS:
+        locked_until = timeutil.to_canonical(
+            now + timedelta(seconds=config.LOCKOUT_SECONDS))
+    conn.execute(
+        "INSERT INTO login_failures (username, failures, locked_until, last_failure_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(username) DO UPDATE SET "
+        "failures=excluded.failures, locked_until=excluded.locked_until, "
+        "last_failure_at=excluded.last_failure_at",
+        (username, failures, locked_until, timeutil.to_canonical(now)))
+    return failures, (config.LOCKOUT_SECONDS if locked_until else 0)
+
+
+def clear_login_failures(conn, username):
+    conn.execute("DELETE FROM login_failures WHERE username=?", (username,))
 
 
 def count_audit_entries(conn):
