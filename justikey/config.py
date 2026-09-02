@@ -54,6 +54,10 @@ MAX_DISCLOSURES_PER_AUTHORIZATION = int(os.environ.get("JUSTIKEY_MAX_DISCLOSURES
 # exists to limit. 0 disables automatic purging.
 RETENTION_DAYS = int(os.environ.get("JUSTIKEY_RETENTION_DAYS", 365))
 
+# How far a signed ingest request's timestamp may be from server time. This
+# bounds both the replay window and how long spent nonces must be remembered.
+INGEST_SIGNATURE_WINDOW_SECONDS = int(os.environ.get("JUSTIKEY_SIGNATURE_WINDOW", 300))
+
 # --- Brute-force resistance ------------------------------------------------
 MAX_FAILED_LOGINS = int(os.environ.get("JUSTIKEY_MAX_FAILED_LOGINS", 5))
 LOCKOUT_SECONDS = int(os.environ.get("JUSTIKEY_LOCKOUT_SECONDS", 900))

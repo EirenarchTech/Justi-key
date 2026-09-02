@@ -1,4 +1,6 @@
 """Data-access layer: users, sessions, LPR events, and authorizations."""
+import hashlib
+import hmac
 from datetime import timedelta
 
 from . import config, crypto_store, crypto_utils, timeutil
@@ -250,12 +252,21 @@ LEFT JOIN users ap ON ap.id = a.approved_by
 def list_authorizations(conn, user):
     """List authorizations, resolving usernames in the same query.
 
-    Requesters see only their own; approvers and auditors see all.
+    Scoped to need-to-know. A requester sees only their own. An approver sees
+    what is pending review plus what they personally decided -- enough to do
+    the job and to be accountable for it, without handing every approver a
+    browsable history of every plate the agency has ever investigated. Only
+    the auditor, whose function is oversight, sees everything.
     """
     if user["role"] == "requester":
         return conn.execute(
             _AUTH_WITH_NAMES + " WHERE a.requested_by=? ORDER BY a.requested_at DESC",
             (user["id"],),
+        ).fetchall()
+    if user["role"] == "approver":
+        return conn.execute(
+            _AUTH_WITH_NAMES + " WHERE a.status='pending' OR a.approved_by=? "
+            "ORDER BY a.requested_at DESC", (user["id"],),
         ).fetchall()
     return conn.execute(_AUTH_WITH_NAMES + " ORDER BY a.requested_at DESC").fetchall()
 
@@ -419,11 +430,12 @@ def count_audit_entries(conn):
 # Sensor sources: registered feeds and their credentials
 # ---------------------------------------------------------------------------
 
-def create_source(conn, source_key, display_name, adapter="justikey", operator=None):
+def create_source(conn, source_key, display_name, adapter="justikey", operator=None,
+                  auth_mode="bearer"):
     cur = conn.execute(
-        "INSERT INTO sources (source_key, display_name, adapter, operator, status, created_at) "
-        "VALUES (?,?,?,?, 'active', ?)",
-        (source_key, display_name, adapter, operator, timeutil.now_iso()),
+        "INSERT INTO sources (source_key, display_name, adapter, operator, auth_mode, "
+        "status, created_at) VALUES (?,?,?,?,?, 'active', ?)",
+        (source_key, display_name, adapter, operator, auth_mode, timeutil.now_iso()),
     )
     return cur.lastrowid
 
@@ -447,14 +459,105 @@ def list_sources(conn):
 
 
 def issue_source_credential(conn, source_id, label="default"):
-    """Mint a new ingest key for a source. Returns the raw key, shown once."""
+    """Mint a new ingest credential. Returns the raw value, shown once.
+
+    A bearer source stores only the hash: the server never needs the secret
+    back. A signing source must recompute an HMAC, so its secret is stored
+    encrypted instead -- which is why encryption at rest is a prerequisite
+    for signing mode.
+    """
     key = crypto_utils.new_token(24)
+    source = get_source(conn, source_id)
+    secret_ct = None
+    if source is not None and source["auth_mode"] == "hmac":
+        cipher = cipher_for(conn)
+        if cipher is None:
+            raise crypto_store.EncryptionError(
+                "signing sources require encryption at rest, so the shared secret "
+                "is not stored in the clear")
+        secret_ct = cipher.encrypt(key, crypto_store.source_aad(source["source_key"]))
     conn.execute(
-        "INSERT INTO source_credentials (key_hash, source_id, label, created_at) "
-        "VALUES (?,?,?,?)",
-        (crypto_utils.hash_token(key), source_id, label, timeutil.now_iso()),
+        "INSERT INTO source_credentials (key_hash, source_id, label, secret_ct, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (crypto_utils.hash_token(key), source_id, label, secret_ct, timeutil.now_iso()),
     )
     return key
+
+
+# --- Signed ingest -----------------------------------------------------------
+
+def signing_secrets_for(conn, source):
+    """Every live signing secret for a source, so rotation overlaps cleanly."""
+    cipher = cipher_for(conn)
+    if cipher is None:
+        return []
+    rows = conn.execute(
+        "SELECT secret_ct FROM source_credentials WHERE source_id=? AND revoked_at IS NULL "
+        "AND secret_ct IS NOT NULL", (source["id"],)).fetchall()
+    aad = crypto_store.source_aad(source["source_key"])
+    return [cipher.decrypt(r["secret_ct"], aad) for r in rows]
+
+
+def signature_base(timestamp, nonce, body):
+    """Bytes a sender signs: request time, nonce, and a digest of the body.
+
+    Covering the body means a captured request cannot be edited in flight;
+    covering the nonce and timestamp means it cannot be replayed.
+    """
+    digest = hashlib.sha256(body or b"").hexdigest()
+    return f"{timestamp}\n{nonce}\n{digest}".encode("utf-8")
+
+
+def compute_signature(secret, timestamp, nonce, body):
+    return hmac.new(secret.encode("utf-8"),
+                    signature_base(timestamp, nonce, body), hashlib.sha256).hexdigest()
+
+
+def claim_ingest_nonce(conn, source_id, nonce):
+    """Spend a nonce once. False means it was already used -- a replay."""
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO ingest_nonces (source_id, nonce, seen_at) VALUES (?,?,?)",
+        (source_id, nonce, timeutil.now_iso()))
+    return cur.rowcount == 1
+
+
+def purge_ingest_nonces(conn):
+    """Forget nonces older than the freshness window; they can no longer be
+    replayed anyway, because their timestamps are already too old."""
+    cutoff = timeutil.to_canonical(
+        timeutil.now() - timedelta(seconds=config.INGEST_SIGNATURE_WINDOW_SECONDS * 2))
+    conn.execute("DELETE FROM ingest_nonces WHERE seen_at < ?", (cutoff,))
+
+
+def authenticate_signed_source(conn, key_id, timestamp, nonce, signature, body):
+    """Verify a signed ingest request. Returns (source, reason)."""
+    if not all([key_id, timestamp, nonce, signature]):
+        return None, "missing signature headers"
+    source = get_source_by_key(conn, key_id)
+    if source is None or source["status"] != "active":
+        return None, "unknown or inactive source"
+    if source["auth_mode"] != "hmac":
+        # Refuse to let a signing source be downgraded to bearer.
+        return None, "source is not configured for signed requests"
+
+    try:
+        skew = abs((timeutil.now() - timeutil.parse_dt(timestamp)).total_seconds())
+    except ValueError:
+        return None, "malformed timestamp"
+    if skew > config.INGEST_SIGNATURE_WINDOW_SECONDS:
+        return None, "timestamp outside the accepted window"
+
+    expected = [compute_signature(s, timestamp, nonce, body)
+                for s in signing_secrets_for(conn, source)]
+    if not any(hmac.compare_digest(e, signature) for e in expected):
+        return None, "signature mismatch"
+
+    # Signature checked before the nonce is spent, so an unauthenticated
+    # caller cannot burn a legitimate sender's nonces.
+    if not claim_ingest_nonce(conn, source["id"], nonce):
+        return None, "nonce already used (replay)"
+    purge_ingest_nonces(conn)
+    return source, None
 
 
 def authenticate_source(conn, key):
@@ -464,12 +567,18 @@ def authenticate_source(conn, key):
     has been revoked, or the source itself is no longer active. Revoking one
     credential or one source leaves every other feed untouched -- the reason
     identity is per-source rather than one shared key.
+
+    Signing sources are refused here, not merely at the HTTP layer. Presenting
+    a signing secret as a bearer token would strip the replay and integrity
+    protection the source was configured for, and a downgrade must fail in the
+    primitive rather than depend on every caller remembering to re-check.
     """
     if not key:
         return None
     row = conn.execute(
         "SELECT s.* FROM source_credentials c JOIN sources s ON s.id = c.source_id "
-        "WHERE c.key_hash = ? AND c.revoked_at IS NULL AND s.status = 'active'",
+        "WHERE c.key_hash = ? AND c.revoked_at IS NULL AND s.status = 'active' "
+        "AND s.auth_mode = 'bearer'",
         (crypto_utils.hash_token(key),),
     ).fetchone()
     return row

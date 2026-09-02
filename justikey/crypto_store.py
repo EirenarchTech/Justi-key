@@ -156,6 +156,10 @@ def user_aad(column, username):
     return f"users:{column}:{username}"
 
 
+def source_aad(source_key):
+    return f"source_credentials:secret:{source_key}"
+
+
 # ---------------------------------------------------------------------------
 # Key loading
 # ---------------------------------------------------------------------------

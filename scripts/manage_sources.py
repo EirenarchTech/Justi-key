@@ -37,10 +37,10 @@ def cmd_list(conn, args):
     if not rows:
         print("No sources registered.")
         return
-    print(f"{'KEY':<22} {'STATUS':<10} {'ADAPTER':<20} {'KEYS':>4} {'EVENTS':>8}  NAME")
+    print(f"{'KEY':<20} {'STATUS':<10} {'AUTH':<7} {'ADAPTER':<19} {'KEYS':>4} {'EVENTS':>7}  NAME")
     for r in rows:
-        print(f"{r['source_key']:<22} {r['status']:<10} {r['adapter']:<20} "
-              f"{r['active_credentials']:>4} {r['observation_count']:>8}  {r['display_name']}")
+        print(f"{r['source_key']:<20} {r['status']:<10} {r['auth_mode']:<7} {r['adapter']:<19} "
+              f"{r['active_credentials']:>4} {r['observation_count']:>7}  {r['display_name']}")
 
 
 def cmd_adapters(conn, args):
@@ -58,13 +58,19 @@ def cmd_register(conn, args):
         print(f"Unknown adapter {args.adapter!r}. Available: {', '.join(adapters.available())}")
         sys.exit(2)
     source_id = models.create_source(conn, args.source_key, args.display_name,
-                                     adapter=args.adapter, operator=args.operator)
+                                     adapter=args.adapter, operator=args.operator,
+                                     auth_mode=args.auth_mode)
     key = models.issue_source_credential(conn, source_id, "initial")
     audit.append_event(conn, "source_registered", args.actor, {
-        "source_key": args.source_key, "adapter": args.adapter, "operator": args.operator})
-    print(f"Registered source '{args.source_key}' (adapter: {args.adapter})")
-    print(f"  ingest key: {key}")
-    print("  This key is shown once. Store it in the sender's configuration now.")
+        "source_key": args.source_key, "adapter": args.adapter,
+        "operator": args.operator, "auth_mode": args.auth_mode})
+    print(f"Registered source '{args.source_key}' "
+          f"(adapter: {args.adapter}, auth: {args.auth_mode})")
+    print(f"  {'signing secret' if args.auth_mode == 'hmac' else 'ingest key'}: {key}")
+    print("  Shown once. Store it in the sender's configuration now.")
+    if args.auth_mode == "hmac":
+        print("  This source signs each request; the secret never goes on the wire, "
+              "and captured requests cannot be replayed.")
 
 
 def cmd_issue_key(conn, args):
@@ -150,6 +156,10 @@ def main():
     p.add_argument("display_name")
     p.add_argument("--adapter", default="justikey")
     p.add_argument("--operator", help="owning agency or vendor")
+    p.add_argument("--auth-mode", choices=("bearer", "hmac"), default="bearer",
+                   dest="auth_mode",
+                   help="bearer sends the key each request; hmac signs instead "
+                        "(recommended: adds replay protection)")
     p.set_defaults(fn=cmd_register)
 
     for name, fn, helptext in (

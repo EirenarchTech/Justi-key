@@ -905,13 +905,29 @@ def ingest(h):
     decides how to read what they sent. A payload cannot name its own source,
     so audit attribution here is authenticated rather than self-declared.
     """
-    api_key = h.headers.get(config.INGEST_API_KEY_HEADER)
-    source = models.authenticate_source(h.conn, api_key)
-    if source is None:
-        audit.append_event(h.conn, "ingest_denied", "sensor:unauthenticated",
-                           {"reason": "unknown, revoked, or inactive credential"})
-        h._send_json(401, {"error": "invalid, revoked, or inactive ingest credential"})
-        return
+    key_id = h.headers.get("X-JustiKey-Key-Id")
+    if key_id:
+        # Signed request: the secret never transits, and the nonce plus
+        # timestamp make a captured request unreplayable.
+        source, reason = models.authenticate_signed_source(
+            h.conn, key_id, h.headers.get("X-JustiKey-Timestamp"),
+            h.headers.get("X-JustiKey-Nonce"), h.headers.get("X-JustiKey-Signature"), h.body)
+        if source is None:
+            audit.append_event(h.conn, "ingest_denied", f"source:{key_id[:64]}",
+                               {"reason": reason, "mode": "hmac"})
+            h._send_json(401, {"error": f"signed request rejected: {reason}"})
+            return
+    else:
+        source = models.authenticate_source(h.conn, h.headers.get(config.INGEST_API_KEY_HEADER))
+        if source is None:
+            audit.append_event(h.conn, "ingest_denied", "sensor:unauthenticated",
+                               {"reason": "unknown, revoked, or inactive credential",
+                                "mode": "bearer"})
+            # Deliberately one message for every bearer failure. A distinct
+            # "this source requires signing" reply would confirm to an
+            # attacker that the credential they hold is otherwise valid.
+            h._send_json(401, {"error": "invalid, revoked, or inactive ingest credential"})
+            return
 
     try:
         payload = h._parse_json()
@@ -952,6 +968,7 @@ def ingest(h):
     if accepted:
         audit.append_event(h.conn, "sensor_ingest", f"source:{source['source_key']}", {
             "source_id": source["id"], "adapter": source["adapter"],
+            "auth_mode": source["auth_mode"],
             "accepted": len(accepted), "rejected": len(rejected),
         })
     if rejected:

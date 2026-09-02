@@ -42,6 +42,9 @@ import time
 from datetime import datetime, timezone
 from urllib import error, request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _signing import signed_headers  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Recognizers

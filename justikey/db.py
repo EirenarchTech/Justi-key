@@ -128,6 +128,10 @@ CREATE TABLE IF NOT EXISTS sources (
     display_name TEXT NOT NULL,
     adapter TEXT NOT NULL DEFAULT 'justikey',
     operator TEXT,
+    -- 'bearer' sends the credential on every request; 'hmac' signs each
+    -- request instead, so the secret never transits and a captured request
+    -- cannot be replayed or modified.
+    auth_mode TEXT NOT NULL DEFAULT 'bearer' CHECK(auth_mode IN ('bearer', 'hmac')),
     status TEXT NOT NULL DEFAULT 'active'
         CHECK(status IN ('active', 'suspended', 'revoked')),
     created_at TEXT NOT NULL,
@@ -141,10 +145,24 @@ CREATE TABLE IF NOT EXISTS source_credentials (
     key_hash TEXT PRIMARY KEY,
     source_id INTEGER NOT NULL REFERENCES sources(id),
     label TEXT NOT NULL,
+    -- Signing sources need the secret itself to recompute an HMAC, so it is
+    -- stored encrypted rather than hashed. Bearer sources leave this NULL.
+    secret_ct TEXT,
     created_at TEXT NOT NULL,
     revoked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_source_credentials_source ON source_credentials(source_id);
+
+-- Nonces already spent by a signing source. A replayed request reuses its
+-- nonce and is refused. Bounded by the signature freshness window, so old
+-- rows are purged rather than accumulating forever.
+CREATE TABLE IF NOT EXISTS ingest_nonces (
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    nonce TEXT NOT NULL,
+    seen_at TEXT NOT NULL,
+    PRIMARY KEY (source_id, nonce)
+);
+CREATE INDEX IF NOT EXISTS idx_ingest_nonces_seen ON ingest_nonces(seen_at);
 
 -- Per-database settings: encryption mode and the key-check canary.
 CREATE TABLE IF NOT EXISTS meta (
@@ -184,6 +202,16 @@ USER_COLUMNS = (
     ("totp_secret_ct", "TEXT"),
 )
 
+SOURCE_COLUMNS = (
+    ("auth_mode", "TEXT NOT NULL DEFAULT 'bearer'"),
+)
+
+CREDENTIAL_COLUMNS = (
+    # Signing sources need the secret itself, not just its hash, so it is
+    # stored encrypted rather than hashed.
+    ("secret_ct", "TEXT"),
+)
+
 
 class Connection(sqlite3.Connection):
     """sqlite3.Connection that can carry per-database state.
@@ -218,7 +246,9 @@ def migrate(conn):
     """Apply additive schema changes to an existing database."""
     for table, columns in (("lpr_events", EVENT_COLUMNS),
                            ("authorizations", AUTHORIZATION_COLUMNS),
-                           ("users", USER_COLUMNS)):
+                           ("users", USER_COLUMNS),
+                           ("sources", SOURCE_COLUMNS),
+                           ("source_credentials", CREDENTIAL_COLUMNS)):
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         for column, decl in columns:
             if column not in existing:
