@@ -1,4 +1,9 @@
-"""Encryption at rest: the control that survives losing the database file."""
+"""v1 encryption at rest: one symmetric key, held by the application.
+
+Superseded as the default by per-record sealing (see test_sealing.py), but
+still the mode an un-migrated database runs in, so it keeps its coverage.
+These tests pin the mode explicitly rather than relying on the default.
+"""
 import os
 import shutil
 import sqlite3
@@ -10,15 +15,28 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from justikey import crypto_store, db, models  # noqa: E402
+from justikey import config, crypto_store, db, models  # noqa: E402
+
+
+class V1ModeMixin:
+    """Force legacy single-key encryption for this test's database."""
+
+    def pin_v1(self):
+        self._sealing_default = config.SEAL_RECORDS
+        config.SEAL_RECORDS = False
+        self.addCleanup(self._restore_sealing)
+
+    def _restore_sealing(self):
+        config.SEAL_RECORDS = self._sealing_default
 
 SKIP = not crypto_store.CRYPTOGRAPHY_AVAILABLE
 WINDOW = ("2026-01-01T00:00:00.000000+00:00", "2026-12-31T00:00:00.000000+00:00")
 
 
 @unittest.skipIf(SKIP, "cryptography is not installed")
-class EncryptedDatabaseTest(unittest.TestCase):
+class EncryptedDatabaseTest(V1ModeMixin, unittest.TestCase):
     def setUp(self):
+        self.pin_v1()
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, "justikey.db")
         db.init_db(self.path)
@@ -36,7 +54,7 @@ class EncryptedDatabaseTest(unittest.TestCase):
 
 
 class TestPlaintextIsAbsentFromDisk(EncryptedDatabaseTest):
-    def test_new_databases_are_encrypted_by_default(self):
+    def test_a_v1_database_uses_single_key_encryption(self):
         self.assertEqual(crypto_store.encryption_mode(self.conn), crypto_store.MODE_V1)
 
     def test_plate_and_location_never_appear_in_the_file(self):
@@ -114,8 +132,9 @@ class TestTamperResistance(EncryptedDatabaseTest):
 
 
 @unittest.skipIf(SKIP, "cryptography is not installed")
-class TestKeyHandling(unittest.TestCase):
+class TestKeyHandling(V1ModeMixin, unittest.TestCase):
     def setUp(self):
+        self.pin_v1()
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, "justikey.db")
         db.init_db(self.path)
@@ -164,10 +183,11 @@ class TestKeyHandling(unittest.TestCase):
 
 
 @unittest.skipIf(SKIP, "cryptography is not installed")
-class TestPlaintextMigration(unittest.TestCase):
+class TestPlaintextMigration(V1ModeMixin, unittest.TestCase):
     """A pre-encryption database must migrate deliberately, never silently."""
 
     def setUp(self):
+        self.pin_v1()
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, "legacy.db")
         os.environ["JUSTIKEY_ENCRYPT_AT_REST"] = "0"

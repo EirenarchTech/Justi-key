@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS lpr_events (
     plate_index TEXT,
     plate_ct TEXT,
     location_ct TEXT,
+    -- v2 sealing: the protected fields under a per-record key, that record
+    -- key wrapped to the disclosure public key, and the ephemeral public key
+    -- the wrap used. The application can write these and cannot open them.
+    record_ct TEXT,
+    wrapped_key TEXT,
+    ephemeral_pub TEXT,
     ingested_at TEXT NOT NULL
 );
 -- The index on source_ref is created by migrate(), not here: on an existing
@@ -199,6 +205,9 @@ EVENT_COLUMNS = (
     ("plate_index", "TEXT"),
     ("plate_ct", "TEXT"),
     ("location_ct", "TEXT"),
+    ("record_ct", "TEXT"),
+    ("wrapped_key", "TEXT"),
+    ("ephemeral_pub", "TEXT"),
 )
 
 AUTHORIZATION_COLUMNS = (
@@ -236,6 +245,8 @@ class Connection(sqlite3.Connection):
     db_path = None
     _cipher = None
     _cipher_loaded = False
+    _sealer = None
+    _sealer_loaded = False
 
 
 def get_connection(db_path=None):
@@ -332,3 +343,13 @@ def _enable_encryption_if_appropriate(conn):
               file=sys.stderr)
         return
     crypto_store.enable_encryption(conn, conn.db_path)
+
+    # Prefer per-record sealing for a database starting out empty: the
+    # application then never holds the ability to read what it collects.
+    from . import sealing
+    if config.SEAL_RECORDS and sealing.SEALING_AVAILABLE:
+        from . import disclosure
+        public_hex = disclosure.public_key_for(conn, conn.db_path, create=True)
+        if public_hex:
+            crypto_store.set_meta(conn, "encryption_mode", crypto_store.MODE_V2)
+            crypto_store.set_meta(conn, "disclosure_public_key", public_hex)

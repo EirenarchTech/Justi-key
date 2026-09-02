@@ -112,11 +112,26 @@ signature, there is no key, so there is no plaintext.
    so a server compromised *while an approver is signing* could misuse that
    moment. What it does buy is that approvals cannot be forged for periods
    when no approver was present, and cannot be altered after the fact.
-2. **Split the key.** Move to per-record keys wrapped to a public key; the
-   app keeps only the public half. Add a disclosure service holding the
-   private key, in-process at first.
+2. **Split the key.** *(built — `justikey/sealing.py`, `justikey/disclosure.py`)*
+   Each observation is sealed under a fresh record key, which is itself
+   wrapped to a disclosure public key via an ephemeral X25519 exchange. The
+   write path holds only the public half, so `search_events` returns rows
+   still sealed and has no way to open them. Everything that turns a sealed
+   record into a plate goes through the disclosure service, which verifies
+   the approver's signature and re-derives scope from the signed statement
+   rather than trusting the caller's selection. Scope is checked against the
+   blind index, so an out-of-scope record is never opened in the act of
+   deciding not to disclose it.
+
+   In `local` mode the private key is loaded into the application process,
+   so the split is structural rather than enforced: it establishes the
+   chokepoint, the wrapping format, and the independent scope check. An
+   attacker with code execution in the application can still reach the key
+   until stage 3 moves it out.
 3. **Separate the service.** Move it to its own host/trust domain, with its
-   own audit ledger and its own anchoring.
+   own audit ledger and its own anchoring. `DisclosureService.disclose()` is
+   deliberately already the interface a remote service would expose, so this
+   changes where it runs rather than what it does.
 4. **Hardware custody.** Approver keys on smartcards; disclosure key in an
    HSM or KMS that enforces the policy check itself.
 

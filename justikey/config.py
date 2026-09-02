@@ -46,6 +46,16 @@ ENCRYPT_AT_REST = os.environ.get("JUSTIKEY_ENCRYPT_AT_REST", "1") == "1"
 # be re-approved before they can be used again.
 REQUIRE_SIGNED_APPROVALS = os.environ.get("JUSTIKEY_REQUIRE_SIGNED_APPROVALS", "1") == "1"
 
+# --- Per-record sealing (capability model, stage 2) ------------------------
+# When enabled, observations are sealed under per-record keys wrapped to a
+# disclosure public key: the application can write them but not read them.
+# Opening goes through the disclosure service, which requires an approver
+# signature. Existing v1 databases keep working until migrated.
+SEAL_RECORDS = os.environ.get("JUSTIKEY_SEAL_RECORDS", "1") == "1"
+# The private half. In local mode this process loads it, so the split is
+# structural rather than enforced; stage 3 moves it out of process.
+DISCLOSURE_PRIVATE_KEY = os.environ.get("JUSTIKEY_DISCLOSURE_KEY") or None
+
 # --- Scope and retention limits --------------------------------------------
 # Widest time window an authorization may request. The approver is expected
 # to judge proportionality, but "not unnecessarily broad" should be enforced

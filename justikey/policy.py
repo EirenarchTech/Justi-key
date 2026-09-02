@@ -6,7 +6,7 @@ request: ownership, approval state, expiration, exact target-plate match,
 and the authorized date/time window. If any condition fails, disclosure
 is denied and the reason is returned so the caller can audit it.
 """
-from . import approvals, config, models, timeutil
+from . import approvals, config, disclosure, models, sealing, timeutil
 
 DENIAL_MESSAGES = {
     "authorization_not_found": "No such authorization exists.",
@@ -19,6 +19,10 @@ DENIAL_MESSAGES = {
                                 "re-approved.",
     "approval_signature_invalid": "This authorization's approval signature does not match its "
                                   "current contents. It may have been altered after approval.",
+    "disclosure_refused": "The disclosure service refused to release these records. The "
+                          "approval could not be verified against the request.",
+    "disclosure_unavailable": "The disclosure service is unavailable, so these records cannot "
+                              "be opened. Records stay sealed; no partial disclosure occurs.",
 }
 
 
@@ -83,7 +87,31 @@ def evaluate_disclosure(conn, auth_id, requested_plate, actor_user):
     if limit > 0 and auth_row["disclosure_count"] >= limit:
         return False, "disclosure_limit_reached", []
 
-    events = models.search_events(
+    candidates = models.search_events(
         conn, auth_row["target_plate"], auth_row["window_start"], auth_row["window_end"]
     )
+
+    try:
+        service = disclosure.service_for(conn, conn.db_path or "")
+    except disclosure.DisclosureError:
+        # The key holder being unreachable is an expected operating state, not
+        # a fault: once the service is a separate process it can be down or
+        # unreachable. Deny cleanly and audibly rather than erroring out, and
+        # never fall back to a path that would open records without it.
+        return False, "disclosure_unavailable", []
+    if service is None:
+        return True, None, candidates      # v1: already revealed
+
+    # v2: this process cannot open a sealed record. The disclosure service
+    # holds the key, and it re-derives scope from the approver's signed
+    # statement rather than trusting the selection made above.
+    approver = models.get_user_by_id(conn, auth_row["approved_by"])
+    statement = approvals.build_statement(
+        auth_row, actor_user["username"], approver["username"],
+        auth_row["approved_at"], auth_row["approval_expires_at"])
+    try:
+        events = service.disclose(candidates, statement, auth_row["approval_signature"],
+                                  approver["signing_pub"], actor_user["username"])
+    except (disclosure.DisclosureError, sealing.SealingError):
+        return False, "disclosure_refused", []
     return True, None, events

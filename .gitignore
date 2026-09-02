@@ -19,3 +19,6 @@ captures/
 
 # Data-encryption key. Committing it would make encryption at rest pointless.
 *.data-key
+
+# Disclosure private key. Whoever holds it can open every sealed record.
+*.disclosure-key

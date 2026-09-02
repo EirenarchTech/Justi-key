@@ -137,6 +137,10 @@ def delete_session(conn, token):
 def cipher_for(conn):
     """The field cipher for this database, or None when stored in the clear.
 
+    Used for operational secrets (TOTP, source signing secrets) in every mode,
+    and for observation fields only under v1. Under v2, observations are
+    sealed per record and this cipher cannot open them.
+
     Cached on the connection: deriving subkeys per row would be wasteful, and
     the key-check must not be re-run on every query.
     """
@@ -144,6 +148,25 @@ def cipher_for(conn):
         conn._cipher = crypto_store.open_cipher(conn, conn.db_path or "")
         conn._cipher_loaded = True
     return conn._cipher
+
+
+def sealer_for(conn):
+    """The record sealer for this database, or None outside v2.
+
+    Deliberately built from the public key alone: the write path must not be
+    able to open what it has written.
+    """
+    if not conn._sealer_loaded:
+        conn._sealer = None
+        if crypto_store.encryption_mode(conn) == crypto_store.MODE_V2:
+            from . import disclosure, sealing
+            public_hex = disclosure.public_key_for(conn, conn.db_path or "")
+            if public_hex is None:
+                raise crypto_store.EncryptionError(
+                    "this database seals observations but no disclosure public key is available")
+            conn._sealer = sealing.RecordSealer(public_hex)
+        conn._sealer_loaded = True
+    return conn._sealer
 
 
 def insert_event(conn, plate, captured_at, camera_id, confidence, location, source_id,
@@ -156,6 +179,23 @@ def insert_event(conn, plate, captured_at, camera_id, confidence, location, sour
     what provenance and audit attribution use.
     """
     captured_at = timeutil.parse(captured_at)
+    sealer = sealer_for(conn)
+    if sealer is not None:
+        # v2: seal to the disclosure public key. Nothing on this path can
+        # read the result back.
+        cipher = cipher_for(conn)
+        record_ct, wrapped_key, ephemeral_pub = sealer.seal(
+            {"plate": plate, "location": location},
+            crypto_store.record_aad(captured_at, camera_id))
+        cur = conn.execute(
+            "INSERT INTO lpr_events (plate, captured_at, camera_id, confidence, location, "
+            "source_id, source_ref, adapter, plate_index, record_ct, wrapped_key, "
+            "ephemeral_pub, ingested_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("", captured_at, camera_id, confidence, None, source_id, source_ref, adapter,
+             cipher.blind_index(plate), record_ct, wrapped_key, ephemeral_pub,
+             timeutil.now_iso()))
+        return cur.lastrowid
+
     cipher = cipher_for(conn)
     if cipher is None:
         stored_plate, plate_index, plate_ct = plate, None, None
@@ -195,19 +235,23 @@ def _reveal_event(cipher, row):
 def search_events(conn, plate, start, end):
     """Exact-plate lookup inside a time window.
 
-    Under encryption the match runs against the keyed blind index, so the
-    query never handles plaintext; values are decrypted only for the rows the
-    policy engine has already authorized.
+    The match runs against the keyed blind index, so the query never handles
+    plaintext. Under v2 the rows come back still sealed: this function has no
+    way to open them, and disclosure goes through the disclosure service.
+    Under v1 the caller's cipher reveals them as before.
     """
     cipher = cipher_for(conn)
     if cipher is None:
         rows = conn.execute(
             "SELECT * FROM lpr_events WHERE plate=? AND captured_at>=? AND captured_at<=? "
             "ORDER BY captured_at ASC", (plate, start, end)).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM lpr_events WHERE plate_index=? AND captured_at>=? AND captured_at<=? "
-            "ORDER BY captured_at ASC", (cipher.blind_index(plate), start, end)).fetchall()
+        return [dict(r) for r in rows]
+
+    rows = conn.execute(
+        "SELECT * FROM lpr_events WHERE plate_index=? AND captured_at>=? AND captured_at<=? "
+        "ORDER BY captured_at ASC", (cipher.blind_index(plate), start, end)).fetchall()
+    if crypto_store.encryption_mode(conn) == crypto_store.MODE_V2:
+        return [dict(r) for r in rows]          # still sealed, deliberately
     return [_reveal_event(cipher, r) for r in rows]
 
 

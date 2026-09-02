@@ -102,6 +102,8 @@ justikey/
   adapters.py    vendor payload translation into one canonical observation
   crypto_store.py AES-256-GCM field encryption and keyed blind index
   approvals.py   approver signing keys and signed authorization statements
+  sealing.py     per-record seal with a public key, open with the private one
+  disclosure.py  the only path that opens a sealed record
   policy.py      disclosure policy engine — the only path to protected data
   templates.py   minimal HTML templating (all interpolation is escaped)
   webapp.py      http.server-based router, auth flow, CSRF, all routes
@@ -117,6 +119,7 @@ scripts/
   edge_agent.py     device-side recognition with store-and-forward buffering
   encrypt_store.py  migrate a plaintext database to encryption at rest
   enforce_retention.py delete observations past their retention period
+  seal_store.py     migrate a v1 database to per-record sealing
   verify_audit.py   independent verifier: chain + anchors + witness
 
 tests/
@@ -135,6 +138,7 @@ tests/
   test_enforcement.py scope breadth, disclosure caps, lockout, retention
   test_signed_ingest.py request signing, replay refusal, need-to-know
   test_approval_signing.py post-approval tampering, forgery, receipts
+  test_sealing.py     the app cannot open records; scoped disclosure only
 ```
 
 ## Encryption at rest
@@ -247,6 +251,67 @@ altered afterwards.
 **Upgrading:** approvals predating signing are refused by default
 (`JUSTIKEY_REQUIRE_SIGNED_APPROVALS=0` to bridge a migration; re-approve
 outstanding authorizations). A wrong signature is refused either way.
+
+## Per-record sealing: the application cannot read what it collects
+
+Encryption at rest protects a database file that has left the building. It
+does nothing against the application itself, which under v1 held one key that
+opened every observation — so the policy engine was the only thing between a
+compromised process and the whole archive.
+
+Each observation is now sealed under its own record key, and that key is
+wrapped to a **disclosure public key** (`justikey/sealing.py`). The write path
+holds only the public half:
+
+```
+encryption mode : v2
+plate column    : ''
+sealed record   : LVY+Pam6an7uYs0kq5dY1tgVO8RkJr3U3cWH...
+wrapped key     : cr4zaLrjPqNh+82BQtcAj5jNxTSVYGRwQ0X4...
+
+search_events returned 1 row(s)
+plate value visible to the application: ''
+data key cannot open it: WrongKeyError
+```
+
+Opening goes through the disclosure service (`justikey/disclosure.py`), which
+verifies the approver's signature and **re-derives scope from the signed
+statement** rather than trusting the caller's selection — a caller that has
+been compromised is precisely the one whose filtering cannot be believed.
+Scope is checked against the blind index, so an out-of-scope record is never
+opened in the act of deciding not to disclose it.
+
+Handed *every* row in the database, the service still opens only the one the
+approval covers.
+
+**The trust boundary, honestly.** In `local` mode the private key is loaded
+into the application process, so the split is structural rather than
+enforced. It establishes the chokepoint, the wrapping format, and the
+independent scope check; an attacker with code execution in the application
+can still reach the key. Stage 3 moves the service to its own process and
+host, at which point the boundary becomes real. `disclose()` is already the
+interface a remote service would expose.
+
+**Availability becomes a safety property.** With the disclosure key absent,
+lawful access stops — correctly — and stops legibly:
+
+```
+with the disclosure key present : Disclosed records (1)
+with the disclosure key removed : The disclosure service is unavailable, so these
+                                  records cannot be opened. Records stay sealed;
+                                  no partial disclosure occurs.
+key restored                    : Disclosed records (1)
+```
+
+**Migrating a v1 database:**
+
+```bash
+python3 scripts/seal_store.py --db justikey.db            # dry run
+python3 scripts/seal_store.py --db justikey.db --apply
+```
+
+Then move the private key off the host (`JUSTIKEY_DISCLOSURE_KEY`). Once
+sealed, losing it loses the archive.
 
 ## Limits enforced in software, not policy
 

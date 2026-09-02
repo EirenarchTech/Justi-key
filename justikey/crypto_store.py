@@ -67,6 +67,9 @@ except ImportError:  # pragma: no cover
 
 MODE_NONE = "none"
 MODE_V1 = "v1"
+# v2 seals observations per record under a disclosure public key; the
+# application can no longer open them (see sealing.py, disclosure.py).
+MODE_V2 = "v2"
 
 NONCE_BYTES = 12
 KEY_BYTES = 32
@@ -160,6 +163,11 @@ def source_aad(source_key):
     return f"source_credentials:secret:{source_key}"
 
 
+def record_aad(captured_at, camera_id):
+    """Binds a sealed observation to the sighting it belongs to."""
+    return f"lpr_events:record:{captured_at}:{camera_id or ''}"
+
+
 # ---------------------------------------------------------------------------
 # Key loading
 # ---------------------------------------------------------------------------
@@ -232,7 +240,7 @@ def open_cipher(conn, db_path, create_key=False):
     database was written with: continuing would mean writing records that can
     never be read back, or reading garbage as if it were evidence.
     """
-    if encryption_mode(conn) != MODE_V1:
+    if encryption_mode(conn) not in (MODE_V1, MODE_V2):
         return None
     root = load_root_key(key_file_for(db_path), create=create_key)
     cipher = FieldCipher(root)
