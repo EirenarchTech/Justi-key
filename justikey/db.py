@@ -21,6 +21,12 @@ CREATE TABLE IF NOT EXISTS users (
     salt TEXT NOT NULL,
     totp_secret TEXT NOT NULL,
     totp_secret_ct TEXT,
+    -- Approver signing key. The private half is wrapped under a key derived
+    -- from the approver's password, so the server can only use it while that
+    -- approver is actively supplying it.
+    signing_pub TEXT,
+    signing_key_ct TEXT,
+    signing_key_salt TEXT,
     role TEXT NOT NULL CHECK(role IN ('requester', 'approver', 'auditor')),
     created_at TEXT NOT NULL
 );
@@ -97,7 +103,10 @@ CREATE TABLE IF NOT EXISTS authorizations (
     approved_at TEXT,
     approval_expires_at TEXT,
     denial_reason TEXT,
-    disclosure_count INTEGER NOT NULL DEFAULT 0
+    disclosure_count INTEGER NOT NULL DEFAULT 0,
+    -- Ed25519 signature by the approver over the exact scope approved. An
+    -- edit to any signed field after approval invalidates it.
+    approval_signature TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_auth_requested_by ON authorizations(requested_by);
 CREATE INDEX IF NOT EXISTS idx_auth_status ON authorizations(status);
@@ -196,10 +205,14 @@ AUTHORIZATION_COLUMNS = (
     # How many disclosures this authorization has already produced, so a
     # single approval cannot be replayed indefinitely inside its window.
     ("disclosure_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("approval_signature", "TEXT"),
 )
 
 USER_COLUMNS = (
     ("totp_secret_ct", "TEXT"),
+    ("signing_pub", "TEXT"),
+    ("signing_key_ct", "TEXT"),
+    ("signing_key_salt", "TEXT"),
 )
 
 SOURCE_COLUMNS = (

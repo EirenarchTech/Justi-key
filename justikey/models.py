@@ -283,23 +283,53 @@ def list_active_authorizations_for_user(conn, user_id):
     ).fetchall()
 
 
-def approve_authorization(conn, auth_id, approver_id):
+def approve_authorization(conn, auth_id, approver_id, signing_key=None):
     """Approve a pending request, refusing self-approval.
 
     The status check and the write are one conditional UPDATE so that two
     approvers acting at the same instant cannot both succeed, and so the
     self-approval prohibition cannot be raced past.
+
+    When a signing key is supplied the approver also signs the exact scope
+    approved, and that signature is stored alongside the status. The
+    signature is produced before the write, so an approval is never recorded
+    without the evidence that backs it.
     """
+    from . import approvals
+
+    auth_row = get_authorization(conn, auth_id)
+    if auth_row is None:
+        return False, "not_found"
+
     now_dt = timeutil.now()
+    approved_at = timeutil.to_canonical(now_dt)
     expires = timeutil.to_canonical(now_dt + timedelta(seconds=config.APPROVAL_VALIDITY_SECONDS))
+
+    signature = None
+    if signing_key is not None:
+        approver = get_user_by_id(conn, approver_id)
+        requester = get_user_by_id(conn, auth_row["requested_by"])
+        if approver is None or requester is None:
+            return False, "not_found"
+        statement = approvals.build_statement(
+            auth_row, requester["username"], approver["username"], approved_at, expires)
+        signature = approvals.sign_statement(signing_key, statement)
+
     cur = conn.execute(
         "UPDATE authorizations SET status='approved', approved_by=?, approved_at=?, "
-        "approval_expires_at=? WHERE id=? AND status='pending' AND requested_by<>?",
-        (approver_id, timeutil.to_canonical(now_dt), expires, auth_id, approver_id),
+        "approval_expires_at=?, approval_signature=? "
+        "WHERE id=? AND status='pending' AND requested_by<>?",
+        (approver_id, approved_at, expires, signature, auth_id, approver_id),
     )
     if cur.rowcount == 1:
         return True, None
     return False, _why_review_failed(conn, auth_id, approver_id, "self_approval_forbidden")
+
+
+def set_signing_key(conn, user_id, public_hex, wrapped, salt):
+    conn.execute(
+        "UPDATE users SET signing_pub=?, signing_key_ct=?, signing_key_salt=? WHERE id=?",
+        (public_hex, wrapped, salt, user_id))
 
 
 def deny_authorization(conn, auth_id, approver_id, reason):

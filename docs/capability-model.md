@@ -98,10 +98,20 @@ signature, there is no key, so there is no plaintext.
 
 ## Staged path
 
-1. **Approver-signed authorizations.** Give approvers signing keys; have them
-   sign the authorization at approval time; store the signature. Verify it in
-   the policy engine. No cryptographic enforcement yet, but the signature
-   becomes non-repudiable evidence and the format stabilizes.
+1. **Approver-signed authorizations.** *(built — `justikey/approvals.py`)*
+   Approvers hold an Ed25519 key whose private half is wrapped under their
+   password, so the server can only sign while the approver is present.
+   Approval requires password plus TOTP, and the approver signs a statement
+   covering the case, legal authority, purpose, target plate, window,
+   requester, approver, and expiry. The policy engine rebuilds that statement
+   from the row's *current* values and verifies it before any disclosure, so a
+   post-approval edit — swapping the target plate onto a genuine approval —
+   is refused rather than silently honoured.
+
+   Not yet cryptographic enforcement: the data key still opens every record,
+   so a server compromised *while an approver is signing* could misuse that
+   moment. What it does buy is that approvals cannot be forged for periods
+   when no approver was present, and cannot be altered after the fact.
 2. **Split the key.** Move to per-record keys wrapped to a public key; the
    app keeps only the public half. Add a disclosure service holding the
    private key, in-process at first.

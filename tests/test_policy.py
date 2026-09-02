@@ -4,7 +4,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import helpers  # noqa: E402
 from justikey import db, models, policy
 
 
@@ -60,7 +62,7 @@ class TestPolicyEngine(unittest.TestCase):
         self.assertEqual(reason, "self_approval_forbidden")
 
     def test_independent_approval_allows_scoped_disclosure(self):
-        ok, reason = models.approve_authorization(self.conn, self.auth_id, self.approver_id)
+        ok, reason = helpers.approve_signed(self.conn, self.auth_id, self.approver_id)
         self.assertTrue(ok)
         allowed, reason, events = policy.evaluate_disclosure(self.conn, self.auth_id, "ABC123", self._requester())
         self.assertTrue(allowed)
@@ -68,20 +70,20 @@ class TestPolicyEngine(unittest.TestCase):
         self.assertEqual(events[0]["plate"], "ABC123")
 
     def test_wrong_plate_denied_even_after_approval(self):
-        models.approve_authorization(self.conn, self.auth_id, self.approver_id)
+        helpers.approve_signed(self.conn, self.auth_id, self.approver_id)
         allowed, reason, events = policy.evaluate_disclosure(self.conn, self.auth_id, "ZZZ999", self._requester())
         self.assertFalse(allowed)
         self.assertEqual(reason, "plate_mismatch")
 
     def test_other_user_cannot_use_someone_elses_authorization(self):
-        models.approve_authorization(self.conn, self.auth_id, self.approver_id)
+        helpers.approve_signed(self.conn, self.auth_id, self.approver_id)
         other = models.get_user_by_id(self.conn, self.other_requester_id)
         allowed, reason, events = policy.evaluate_disclosure(self.conn, self.auth_id, "ABC123", other)
         self.assertFalse(allowed)
         self.assertEqual(reason, "authorization_not_owned_by_requester")
 
     def test_expired_authorization_denies_disclosure(self):
-        models.approve_authorization(self.conn, self.auth_id, self.approver_id)
+        helpers.approve_signed(self.conn, self.auth_id, self.approver_id)
         # Force expiry into the past.
         self.conn.execute(
             "UPDATE authorizations SET approval_expires_at=? WHERE id=?",

@@ -4,7 +4,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import helpers  # noqa: E402
 from justikey import db, models, policy, timeutil
 
 
@@ -71,7 +73,7 @@ class TestWindowFilteringAcrossVendorFormats(unittest.TestCase):
             window_end=timeutil.parse("2026-08-31T23:59:59"),
             requested_by=self.requester_id,
         )
-        models.approve_authorization(self.conn, self.auth_id, self.approver_id)
+        helpers.approve_signed(self.conn, self.auth_id, self.approver_id)
 
     def tearDown(self):
         self.conn.close()

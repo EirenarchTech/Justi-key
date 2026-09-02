@@ -15,6 +15,7 @@ from datetime import timedelta
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import helpers  # noqa: E402
 from justikey import audit, config, db, models, policy, timeutil  # noqa: E402
 
 
@@ -65,7 +66,7 @@ class PolicyFixture(unittest.TestCase):
             self.conn, "CASE-1", "Warrant 1", "Investigation", "ABC123",
             timeutil.to_canonical(now - timedelta(days=2)),
             timeutil.to_canonical(now + timedelta(days=2)), self.requester_id)
-        models.approve_authorization(self.conn, self.auth_id, self.approver_id)
+        helpers.approve_signed(self.conn, self.auth_id, self.approver_id)
 
     def tearDown(self):
         self.conn.close()

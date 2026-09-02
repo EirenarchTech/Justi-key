@@ -39,6 +39,13 @@ DATA_KEY_HEX = os.environ.get("JUSTIKEY_DATA_KEY") or None
 # New databases are encrypted unless this is explicitly disabled.
 ENCRYPT_AT_REST = os.environ.get("JUSTIKEY_ENCRYPT_AT_REST", "1") == "1"
 
+# Refuse to disclose against an approval that carries no valid approver
+# signature. Secure by default: an unsigned approval is indistinguishable in
+# the database from a forged one. Turning this off is only for upgrading a
+# deployment whose existing approvals predate signing -- those approvals must
+# be re-approved before they can be used again.
+REQUIRE_SIGNED_APPROVALS = os.environ.get("JUSTIKEY_REQUIRE_SIGNED_APPROVALS", "1") == "1"
+
 # --- Scope and retention limits --------------------------------------------
 # Widest time window an authorization may request. The approver is expected
 # to judge proportionality, but "not unnecessarily broad" should be enforced

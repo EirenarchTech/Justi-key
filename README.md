@@ -65,8 +65,10 @@ Use `--reset` to wipe the database and start over: `python3 scripts/run_server.p
    sits in `pending` state — nothing is disclosable yet.
 2. `officer1` cannot approve their own request: the UI hides the control,
    and the server independently rejects it even if the request were forged.
-3. `supervisor1` signs in separately, reviews the request, enters a fresh
-   TOTP code, and approves it. Approval is valid for ~30 minutes.
+3. `supervisor1` signs in separately, reviews the request, and approves it
+   with their password and a fresh TOTP code. The password unlocks their
+   signing key, so the approval is signed rather than merely recorded.
+   Approval is valid for ~30 minutes.
 4. `officer1` can now search — but only for the exact plate named in the
    authorization, and only within the authorized time window. Any other
    plate, a stale/expired authorization, or an authorization belonging to
@@ -99,6 +101,7 @@ justikey/
   anchor.py      signed checkpoints making tail truncation detectable
   adapters.py    vendor payload translation into one canonical observation
   crypto_store.py AES-256-GCM field encryption and keyed blind index
+  approvals.py   approver signing keys and signed authorization statements
   policy.py      disclosure policy engine — the only path to protected data
   templates.py   minimal HTML templating (all interpolation is escaped)
   webapp.py      http.server-based router, auth flow, CSRF, all routes
@@ -130,6 +133,8 @@ tests/
   test_edge_agent.py  buffering, once-only recognition, recognizer parsing
   test_encryption.py  plaintext absent from disk, AAD binding, key handling
   test_enforcement.py scope breadth, disclosure caps, lockout, retention
+  test_signed_ingest.py request signing, replay refusal, need-to-know
+  test_approval_signing.py post-approval tampering, forgery, receipts
 ```
 
 ## Encryption at rest
@@ -201,6 +206,47 @@ and it cuts both ways.
   patterns of an unidentified vehicle, not its identity.
 - **A running server holds the key.** This protects data at rest, not against
   a live host compromise.
+
+## Approver-signed authorizations
+
+Approval used to be a status column. Anyone able to write to the database
+could flip it — or, more quietly, leave the approval alone and change what it
+authorizes. Swapping `target_plate` on an already-approved row yields a
+different vehicle's history under a real approval with a real approver's
+name on it, and nothing notices.
+
+Approvals are now signed (`justikey/approvals.py`). The approver holds an
+Ed25519 key whose private half is wrapped under their password, so approval
+requires password **and** TOTP, and the server can only sign while the
+approver is actually present. The signed statement covers the case, legal
+authority, purpose, target plate, window, requester, approver, and expiry.
+
+Before any disclosure the policy engine rebuilds that statement from the
+row's *current* values and verifies it. Live, against a direct database edit:
+
+```
+row now says: plate=ZZZ999 status=approved approved_by=2
+  (a real approver, a real approval, pointed at a different vehicle)
+
+DENIED: This authorization's approval signature does not match its
+        current contents. It may have been altered after approval.
+```
+
+An approval also produces a portable receipt — statement, signature, and the
+approver's public key — verifiable by a third party without access to the
+database.
+
+**What this does not yet do.** The data key still opens every record, so a
+server compromised *at the moment an approver is signing* could misuse that
+moment. Closing that needs the disclosure service in
+[docs/capability-model.md](docs/capability-model.md), demonstrated end to end
+by `scripts/capability_poc.py`. What signing buys today is that approvals
+cannot be forged for periods when no approver was present, and cannot be
+altered afterwards.
+
+**Upgrading:** approvals predating signing are refused by default
+(`JUSTIKEY_REQUIRE_SIGNED_APPROVALS=0` to bridge a migration; re-approve
+outstanding authorizations). A wrong signature is refused either way.
 
 ## Limits enforced in software, not policy
 

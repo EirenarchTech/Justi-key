@@ -20,8 +20,8 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import (adapters, anchor, audit, config, crypto_utils, db, models, policy,
-               templates, timeutil)
+from . import (adapters, anchor, approvals, audit, config, crypto_utils, db, models,
+               policy, templates, timeutil)
 
 SESSION_COOKIE = config.SESSION_COOKIE_NAME
 PENDING_COOKIE = config.PENDING_COOKIE_NAME
@@ -627,12 +627,16 @@ def approve_form(h, auth_id):
 <h2>Approve authorization #{auth_row['id']}</h2>
 <p>Case <code>{templates.escape(auth_row['case_number'])}</code> &mdash; plate
 <code>{templates.escape(auth_row['target_plate'])}</code></p>
-<p class="hint">Confirm your identity with a current authenticator code before this request is approved.</p>
+<p class="hint">You are about to sign this authorization. Your password unlocks the
+signing key that only you hold, so the approval carries your name in a form that can be
+verified later and cannot be altered afterwards.</p>
 <form method="post" action="/authorizations/{auth_row['id']}/approve">
 {templates.csrf_field(h.session_row['csrf_token'])}
+<label>Your password</label>
+<input type="password" name="password" autocomplete="current-password" required autofocus>
 <label>6-digit authenticator code</label>
-<input type="text" name="code" inputmode="numeric" pattern="[0-9]*" maxlength="6" required autofocus>
-<button type="submit">Approve</button>
+<input type="text" name="code" inputmode="numeric" pattern="[0-9]*" maxlength="6" required>
+<button type="submit">Sign and approve</button>
 </form>
 </div>
 """
@@ -650,12 +654,23 @@ def approve_submit(h, auth_id):
     if auth_row["requested_by"] == user["id"]:
         audit.append_event(h.conn, "self_approval_denied", user["username"], {"authorization_id": int(auth_id)})
         raise HttpError(403, "You cannot approve your own request.")
+    # Password step-up: the approver's signing key is wrapped under it, so
+    # the server can only sign while the approver is actually present.
+    password = form.get("password", "")
+    if not crypto_utils.verify_password(password, user["salt"], user["password_hash"]):
+        audit.append_event(h.conn, "approval_password_failed", user["username"],
+                           {"authorization_id": int(auth_id)})
+        raise HttpError(403, "Password incorrect.")
+
     # A fresh code per approval: consuming it prevents one code from
     # rubber-stamping several requests inside the same 30-second step.
     if not models.consume_totp(h.conn, user, form.get("code", ""), "approval"):
         audit.append_event(h.conn, "approval_totp_failed", user["username"], {"authorization_id": int(auth_id)})
         raise HttpError(403, "Invalid, expired, or already-used authenticator code.")
-    ok, reason = models.approve_authorization(h.conn, int(auth_id), user["id"])
+
+    signing_key = _approver_signing_key(h, user, password)
+    ok, reason = models.approve_authorization(h.conn, int(auth_id), user["id"],
+                                              signing_key=signing_key)
     if not ok:
         audit.append_event(h.conn, "approval_denied", user["username"], {
             "authorization_id": int(auth_id), "reason": reason,
@@ -664,8 +679,33 @@ def approve_submit(h, auth_id):
     audit.append_event(h.conn, "authorization_approved", user["username"], {
         "authorization_id": int(auth_id),
         "target_plate": auth_row["target_plate"],
+        "signed": signing_key is not None,
     })
     h._redirect(f"/authorizations/{auth_id}")
+
+
+def _approver_signing_key(h, user, password):
+    """Unlock this approver's signing key, creating one on first use.
+
+    Existing approvers predate signing, and their password is only available
+    at this moment, so the key is generated here rather than at account
+    creation. Failing to sign is not silently tolerated: an unsigned approval
+    would look identical to a signed one in the database while proving
+    nothing.
+    """
+    if not approvals.SIGNING_AVAILABLE:
+        raise HttpError(500, "Approval signing is unavailable on this server.")
+    if not user["signing_pub"]:
+        public_hex, wrapped, salt = approvals.generate_signing_key(password)
+        models.set_signing_key(h.conn, user["id"], public_hex, wrapped, salt)
+        audit.append_event(h.conn, "approver_key_created", user["username"],
+                           {"public_key": public_hex})
+        user = models.get_user_by_id(h.conn, user["id"])
+    try:
+        return approvals.unwrap_signing_key(user, password)
+    except approvals.ApprovalKeyError as exc:
+        audit.append_event(h.conn, "approver_key_unusable", user["username"], {"reason": str(exc)})
+        raise HttpError(403, "Your signing key could not be unlocked.") from exc
 
 
 @route("POST", r"/authorizations/(?P<auth_id>\d+)/deny")

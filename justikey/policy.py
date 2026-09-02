@@ -6,7 +6,7 @@ request: ownership, approval state, expiration, exact target-plate match,
 and the authorized date/time window. If any condition fails, disclosure
 is denied and the reason is returned so the caller can audit it.
 """
-from . import config, models, timeutil
+from . import approvals, config, models, timeutil
 
 DENIAL_MESSAGES = {
     "authorization_not_found": "No such authorization exists.",
@@ -17,6 +17,8 @@ DENIAL_MESSAGES = {
     "window_too_broad": "This authorization's time window exceeds the permitted maximum.",
     "disclosure_limit_reached": "This authorization has reached its disclosure limit and must be "
                                 "re-approved.",
+    "approval_signature_invalid": "This authorization's approval signature does not match its "
+                                  "current contents. It may have been altered after approval.",
 }
 
 
@@ -63,6 +65,19 @@ def evaluate_disclosure(conn, auth_id, requested_plate, actor_user):
     within_limit, _ = check_window_breadth(auth_row["window_start"], auth_row["window_end"])
     if not within_limit:
         return False, "window_too_broad", []
+
+    # The approver signed the exact scope. Rebuilding that statement from the
+    # row and checking it catches any post-approval edit -- widening the
+    # window, or swapping the target plate onto a real approver's name.
+    signed_ok, signature_reason = approvals.verify_authorization(conn, auth_row)
+    if not signed_ok:
+        # A missing signature and a wrong one are different failures. A wrong
+        # signature means the row was altered and is always refused; a missing
+        # one means the approval predates signing, which a deployment may
+        # deliberately tolerate while it migrates.
+        unsigned = signature_reason == "approval carries no signature"
+        if not unsigned or config.REQUIRE_SIGNED_APPROVALS:
+            return False, "approval_signature_invalid", []
 
     limit = config.MAX_DISCLOSURES_PER_AUTHORIZATION
     if limit > 0 and auth_row["disclosure_count"] >= limit:
