@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS users (
     signing_pub TEXT,
     signing_key_ct TEXT,
     signing_key_salt TEXT,
+    signing_key_revoked_at TEXT,
     role TEXT NOT NULL CHECK(role IN ('requester', 'approver', 'auditor')),
     created_at TEXT NOT NULL
 );
@@ -81,6 +82,10 @@ CREATE TABLE IF NOT EXISTS lpr_events (
     record_ct TEXT,
     wrapped_key TEXT,
     ephemeral_pub TEXT,
+    -- Envelope identity, all authenticated as AAD alongside the ciphertext.
+    record_uid TEXT,
+    seal_version TEXT,
+    recipient_key_id TEXT,
     ingested_at TEXT NOT NULL
 );
 -- The index on source_ref is created by migrate(), not here: on an existing
@@ -208,6 +213,9 @@ EVENT_COLUMNS = (
     ("record_ct", "TEXT"),
     ("wrapped_key", "TEXT"),
     ("ephemeral_pub", "TEXT"),
+    ("record_uid", "TEXT"),
+    ("seal_version", "TEXT"),
+    ("recipient_key_id", "TEXT"),
 )
 
 AUTHORIZATION_COLUMNS = (
@@ -219,6 +227,7 @@ AUTHORIZATION_COLUMNS = (
 
 USER_COLUMNS = (
     ("totp_secret_ct", "TEXT"),
+    ("signing_key_revoked_at", "TEXT"),
     ("signing_pub", "TEXT"),
     ("signing_key_ct", "TEXT"),
     ("signing_key_salt", "TEXT"),
@@ -247,6 +256,7 @@ class Connection(sqlite3.Connection):
     _cipher_loaded = False
     _sealer = None
     _sealer_loaded = False
+    _index_client = None
 
 
 def get_connection(db_path=None):
@@ -351,5 +361,5 @@ def _enable_encryption_if_appropriate(conn):
         from . import disclosure
         public_hex = disclosure.public_key_for(conn, conn.db_path, create=True)
         if public_hex:
-            crypto_store.set_meta(conn, "encryption_mode", crypto_store.MODE_V2)
+            crypto_store.set_meta(conn, "encryption_mode", crypto_store.MODE_V3)
             crypto_store.set_meta(conn, "disclosure_public_key", public_hex)

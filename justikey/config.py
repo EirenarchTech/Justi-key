@@ -56,6 +56,20 @@ SEAL_RECORDS = os.environ.get("JUSTIKEY_SEAL_RECORDS", "1") == "1"
 # structural rather than enforced; stage 3 moves it out of process.
 DISCLOSURE_PRIVATE_KEY = os.environ.get("JUSTIKEY_DISCLOSURE_KEY") or None
 
+# Stage 3: point the application at a separate disclosure service. When set,
+# the application must hold neither the disclosure private key nor the
+# blind-index key -- that is the whole point of moving the service out.
+DISCLOSURE_URL = os.environ.get("JUSTIKEY_DISCLOSURE_URL") or None
+DISCLOSURE_PUBLIC_KEY = os.environ.get("JUSTIKEY_DISCLOSURE_PUBLIC_KEY") or None
+DISCLOSURE_CLIENT_ID = os.environ.get("JUSTIKEY_DISCLOSURE_CLIENT_ID", "justikey-app")
+DISCLOSURE_CLIENT_SECRET = os.environ.get("JUSTIKEY_DISCLOSURE_CLIENT_SECRET") or None
+DISCLOSURE_TIMEOUT_SECONDS = float(os.environ.get("JUSTIKEY_DISCLOSURE_TIMEOUT", 10.0))
+
+# The blind-index key. Plates are low-entropy, so whoever holds this can
+# enumerate them offline against the stored indexes without decrypting
+# anything. In remote mode it belongs to the disclosure service alone.
+INDEX_KEY_HEX = os.environ.get("JUSTIKEY_INDEX_KEY") or None
+
 # --- Scope and retention limits --------------------------------------------
 # Widest time window an authorization may request. The approver is expected
 # to judge proportionality, but "not unnecessarily broad" should be enforced

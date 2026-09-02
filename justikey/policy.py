@@ -108,10 +108,22 @@ def evaluate_disclosure(conn, auth_id, requested_plate, actor_user):
     approver = models.get_user_by_id(conn, auth_row["approved_by"])
     statement = approvals.build_statement(
         auth_row, actor_user["username"], approver["username"],
-        auth_row["approved_at"], auth_row["approval_expires_at"])
+        auth_row["approved_at"], auth_row["approval_expires_at"],
+        approver_key_id=sealing.key_id(approver["signing_pub"]))
     try:
-        events = service.disclose(candidates, statement, auth_row["approval_signature"],
-                                  approver["signing_pub"], actor_user["username"])
+        opened = service.disclose(candidates, statement, auth_row["approval_signature"],
+                                  actor_user["username"])
     except (disclosure.DisclosureError, sealing.SealingError):
         return False, "disclosure_refused", []
+
+    by_id = {item["id"]: item for item in opened}
+    events = []
+    for row in candidates:
+        fields = by_id.get(row["id"])
+        if fields is None:
+            continue
+        event = dict(row)
+        event["plate"] = fields.get("plate")
+        event["location"] = fields.get("location")
+        events.append(event)
     return True, None, events

@@ -70,6 +70,8 @@ MODE_V1 = "v1"
 # v2 seals observations per record under a disclosure public key; the
 # application can no longer open them (see sealing.py, disclosure.py).
 MODE_V2 = "v2"
+# v3 adds full envelope binding and moves the index key out of the app.
+MODE_V3 = "v3"
 
 NONCE_BYTES = 12
 KEY_BYTES = 32
@@ -163,9 +165,30 @@ def source_aad(source_key):
     return f"source_credentials:secret:{source_key}"
 
 
-def record_aad(captured_at, camera_id):
-    """Binds a sealed observation to the sighting it belongs to."""
-    return f"lpr_events:record:{captured_at}:{camera_id or ''}"
+def resolve_index_key(db_path):
+    """The blind-index key. Refuses outright when a separate service exists.
+
+    Plates are low-entropy: the whole AAA999 space is ~17.5M candidates, so
+    whoever holds this key can enumerate it against the stored indexes and
+    recover plate identities without decrypting anything. Removing the
+    *usage* from the application is not enough -- the key must not be
+    derivable from anything the application holds, or a compromised
+    application simply derives it and runs the enumeration itself.
+
+    In local mode the application does hold it, which is one of the reasons
+    local mode is structural rather than enforced.
+    """
+    if config.DISCLOSURE_URL:
+        raise EncryptionError(
+            "the blind-index key belongs to the disclosure service and is not "
+            "available to this application; holding it would permit offline "
+            "enumeration of the plate space")
+    if config.INDEX_KEY_HEX:
+        key = bytes.fromhex(config.INDEX_KEY_HEX.strip())
+        if len(key) != KEY_BYTES:
+            raise EncryptionError(f"JUSTIKEY_INDEX_KEY must be {KEY_BYTES * 2} hex characters")
+        return key
+    return _hkdf(load_root_key(key_file_for(db_path)), _IDX_LABEL)
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +263,7 @@ def open_cipher(conn, db_path, create_key=False):
     database was written with: continuing would mean writing records that can
     never be read back, or reading garbage as if it were evidence.
     """
-    if encryption_mode(conn) not in (MODE_V1, MODE_V2):
+    if encryption_mode(conn) not in (MODE_V1, MODE_V2, MODE_V3):
         return None
     root = load_root_key(key_file_for(db_path), create=create_key)
     cipher = FieldCipher(root)

@@ -151,14 +151,14 @@ def cipher_for(conn):
 
 
 def sealer_for(conn):
-    """The record sealer for this database, or None outside v2.
+    """The record sealer for this database, or None outside v3.
 
     Deliberately built from the public key alone: the write path must not be
     able to open what it has written.
     """
     if not conn._sealer_loaded:
         conn._sealer = None
-        if crypto_store.encryption_mode(conn) == crypto_store.MODE_V2:
+        if crypto_store.encryption_mode(conn) == crypto_store.MODE_V3:
             from . import disclosure, sealing
             public_hex = disclosure.public_key_for(conn, conn.db_path or "")
             if public_hex is None:
@@ -167,6 +167,22 @@ def sealer_for(conn):
             conn._sealer = sealing.RecordSealer(public_hex)
         conn._sealer_loaded = True
     return conn._sealer
+
+
+def scope_token(conn, plate):
+    """The blind index for a plate.
+
+    In remote mode this application has no index key, so it asks the
+    disclosure service. Holding the key locally would let a compromised
+    application enumerate the low-entropy plate space offline against the
+    stored indexes -- recovering plate identities without decrypting anything.
+    """
+    from . import disclosure
+    if disclosure.is_remote():
+        if not conn._index_client:
+            conn._index_client = disclosure.service_for(conn, conn.db_path or "")
+        return conn._index_client.blind_index(plate)
+    return cipher_for(conn).blind_index(plate)
 
 
 def insert_event(conn, plate, captured_at, camera_id, confidence, location, source_id,
@@ -181,18 +197,19 @@ def insert_event(conn, plate, captured_at, camera_id, confidence, location, sour
     captured_at = timeutil.parse(captured_at)
     sealer = sealer_for(conn)
     if sealer is not None:
-        # v2: seal to the disclosure public key. Nothing on this path can
-        # read the result back.
-        cipher = cipher_for(conn)
-        record_ct, wrapped_key, ephemeral_pub = sealer.seal(
-            {"plate": plate, "location": location},
-            crypto_store.record_aad(captured_at, camera_id))
+        # v3: seal to the disclosure public key. Nothing on this path can read
+        # the result back, and the envelope is bound to this sighting.
+        index = scope_token(conn, plate)
+        env = sealer.seal({"plate": plate, "location": location},
+                          captured_at, camera_id, index)
         cur = conn.execute(
             "INSERT INTO lpr_events (plate, captured_at, camera_id, confidence, location, "
             "source_id, source_ref, adapter, plate_index, record_ct, wrapped_key, "
-            "ephemeral_pub, ingested_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "ephemeral_pub, record_uid, seal_version, recipient_key_id, ingested_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             ("", captured_at, camera_id, confidence, None, source_id, source_ref, adapter,
-             cipher.blind_index(plate), record_ct, wrapped_key, ephemeral_pub,
+             index, env["record_ct"], env["wrapped_key"], env["ephemeral_pub"],
+             env["record_uid"], env["seal_version"], env["recipient_key_id"],
              timeutil.now_iso()))
         return cur.lastrowid
 
@@ -249,8 +266,8 @@ def search_events(conn, plate, start, end):
 
     rows = conn.execute(
         "SELECT * FROM lpr_events WHERE plate_index=? AND captured_at>=? AND captured_at<=? "
-        "ORDER BY captured_at ASC", (cipher.blind_index(plate), start, end)).fetchall()
-    if crypto_store.encryption_mode(conn) == crypto_store.MODE_V2:
+        "ORDER BY captured_at ASC", (scope_token(conn, plate), start, end)).fetchall()
+    if crypto_store.encryption_mode(conn) == crypto_store.MODE_V3:
         return [dict(r) for r in rows]          # still sealed, deliberately
     return [_reveal_event(cipher, r) for r in rows]
 
@@ -355,8 +372,10 @@ def approve_authorization(conn, auth_id, approver_id, signing_key=None):
         requester = get_user_by_id(conn, auth_row["requested_by"])
         if approver is None or requester is None:
             return False, "not_found"
+        from . import sealing as _sealing
         statement = approvals.build_statement(
-            auth_row, requester["username"], approver["username"], approved_at, expires)
+            auth_row, requester["username"], approver["username"], approved_at, expires,
+            approver_key_id=_sealing.key_id(approver["signing_pub"]) if approver["signing_pub"] else None)
         signature = approvals.sign_statement(signing_key, statement)
 
     cur = conn.execute(
@@ -656,6 +675,12 @@ def authenticate_source(conn, key):
         (crypto_utils.hash_token(key),),
     ).fetchone()
     return row
+
+
+def revoke_signing_key(conn, user_id):
+    """Retire an approver's signing key; approvals under it stop verifying."""
+    conn.execute("UPDATE users SET signing_key_revoked_at=? WHERE id=?",
+                 (timeutil.now_iso(), user_id))
 
 
 def revoke_source(conn, source_id, status="revoked"):

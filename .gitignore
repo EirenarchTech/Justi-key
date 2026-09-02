@@ -22,3 +22,6 @@ captures/
 
 # Disclosure private key. Whoever holds it can open every sealed record.
 *.disclosure-key
+disclosure-audit.db
+approvers.json
+service.key

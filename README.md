@@ -103,7 +103,7 @@ justikey/
   crypto_store.py AES-256-GCM field encryption and keyed blind index
   approvals.py   approver signing keys and signed authorization statements
   sealing.py     per-record seal with a public key, open with the private one
-  disclosure.py  the only path that opens a sealed record
+  disclosure.py  the only path that opens a sealed record (local or remote)
   policy.py      disclosure policy engine — the only path to protected data
   templates.py   minimal HTML templating (all interpolation is escaped)
   webapp.py      http.server-based router, auth flow, CSRF, all routes
@@ -120,6 +120,7 @@ scripts/
   encrypt_store.py  migrate a plaintext database to encryption at rest
   enforce_retention.py delete observations past their retention period
   seal_store.py     migrate a v1 database to per-record sealing
+  disclosure_server.py the disclosure service, as its own process and principal
   verify_audit.py   independent verifier: chain + anchors + witness
 
 tests/
@@ -138,7 +139,7 @@ tests/
   test_enforcement.py scope breadth, disclosure caps, lockout, retention
   test_signed_ingest.py request signing, replay refusal, need-to-know
   test_approval_signing.py post-approval tampering, forgery, receipts
-  test_sealing.py     the app cannot open records; scoped disclosure only
+  test_sealing.py     envelope binding, scoped disclosure, index-key withholding
 ```
 
 ## Encryption at rest
@@ -284,13 +285,43 @@ opened in the act of deciding not to disclose it.
 Handed *every* row in the database, the service still opens only the one the
 approval covers.
 
-**The trust boundary, honestly.** In `local` mode the private key is loaded
-into the application process, so the split is structural rather than
-enforced. It establishes the chokepoint, the wrapping format, and the
-independent scope check; an attacker with code execution in the application
-can still reach the key. Stage 3 moves the service to its own process and
-host, at which point the boundary becomes real. `disclose()` is already the
-interface a remote service would expose.
+### Running the service separately (stage 3)
+
+```bash
+python3 scripts/disclosure_server.py --port 8090 \
+    --key-file service.key --index-key "$INDEX_KEY" \
+    --client-secret "$CLIENT_SECRET" --approvers approvers.json \
+    --ledger disclosure-audit.db
+```
+
+The application then gets the public key and the client secret, and **neither
+private key**:
+
+```bash
+JUSTIKEY_DISCLOSURE_URL=http://disclosure-host:8090 \
+JUSTIKEY_DISCLOSURE_PUBLIC_KEY=<public key> \
+JUSTIKEY_DISCLOSURE_CLIENT_SECRET=<secret> python3 scripts/run_server.py
+```
+
+With the web application fully compromised — database, environment,
+arbitrary SQL, code execution:
+
+| Attempt | Result |
+|---|---|
+| Read plate/location columns | empty; sealed |
+| Decrypt with the application's data key | refused (`WrongKeyError`) |
+| Find a disclosure private key on the host | none present |
+| Derive the index key and enumerate offline | refused |
+| Forge an approval with an attacker's key | refused: the service holds its own approver registry |
+
+The service keeps its own hash-chained ledger, and its writes are serialized
+so concurrent disclosures cannot fork the chain. It deliberately does not log
+the plate in a scope-token request: doing so would rebuild the archive it
+exists to protect.
+
+In `local` mode (no `JUSTIKEY_DISCLOSURE_URL`) the private key and index key
+live in the application process, so the split is structural rather than
+enforced. That mode is for development.
 
 **Availability becomes a safety property.** With the disclosure key absent,
 lawful access stops — correctly — and stops legibly:

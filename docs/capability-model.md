@@ -128,10 +128,26 @@ signature, there is no key, so there is no plaintext.
    chokepoint, the wrapping format, and the independent scope check. An
    attacker with code execution in the application can still reach the key
    until stage 3 moves it out.
-3. **Separate the service.** Move it to its own host/trust domain, with its
-   own audit ledger and its own anchoring. `DisclosureService.disclose()` is
-   deliberately already the interface a remote service would expose, so this
-   changes where it runs rather than what it does.
+3. **Separate the service.** *(built — `scripts/disclosure_server.py`)*
+   The service runs as its own process and principal, holding the disclosure
+   private key **and** the blind-index key, with its own append-only
+   hash-chained ledger. The application holds neither key: it seals against a
+   public key, obtains scope tokens from the service, and sends candidate
+   rows to be opened.
+
+   Three things the service does not take from its caller: the approver's
+   public key (it keeps its own enrolment, so a compromised application
+   cannot present a key it controls), the index key, and the selection of
+   rows. Envelopes bind format version, recipient key id, record uid, capture
+   time, camera and blind index as AAD, so nothing can be transplanted
+   between records.
+
+   Building this found that removing the *use* of the index key from the
+   application was not enough — it remained derivable from the data key, so a
+   compromised application could still enumerate offline.
+   `resolve_index_key()` now refuses outright in remote mode. See
+   [threat-model.md](threat-model.md) finding 1 for the residual that
+   remains.
 4. **Hardware custody.** Approver keys on smartcards; disclosure key in an
    HSM or KMS that enforces the policy check itself.
 

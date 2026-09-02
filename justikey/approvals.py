@@ -39,7 +39,7 @@ verified.
 """
 import json
 
-from . import crypto_store, crypto_utils, timeutil
+from . import crypto_store, crypto_utils, sealing, timeutil
 
 try:  # pragma: no cover
     from cryptography.exceptions import InvalidSignature
@@ -51,7 +51,7 @@ except ImportError:  # pragma: no cover
     ed25519 = None
     SIGNING_AVAILABLE = False
 
-STATEMENT_VERSION = 1
+STATEMENT_VERSION = 2
 
 
 class ApprovalKeyError(RuntimeError):
@@ -62,7 +62,20 @@ class ApprovalKeyError(RuntimeError):
 # The signed statement
 # ---------------------------------------------------------------------------
 
-def build_statement(auth_row, requester, approver, approved_at, expires_at):
+def statement_nonce(auth_row, approved_at):
+    """Deterministic per-approval nonce.
+
+    Derived rather than random so the statement can be rebuilt from the row
+    for verification, while still being unique to this approval and usable by
+    the disclosure service for replay rejection.
+    """
+    import hashlib
+    return hashlib.sha256(
+        f"{auth_row['id']}|{approved_at}|{auth_row['target_plate']}".encode()).hexdigest()[:32]
+
+
+def build_statement(auth_row, requester, approver, approved_at, expires_at,
+                    approver_key_id=None):
     """The exact scope an approver puts their name to.
 
     Every field that narrows the authorization is included. Anything omitted
@@ -72,6 +85,8 @@ def build_statement(auth_row, requester, approver, approved_at, expires_at):
     return {
         "v": STATEMENT_VERSION,
         "authorization_id": auth_row["id"],
+        "approver_key_id": approver_key_id,
+        "nonce": statement_nonce(auth_row, approved_at),
         "case_number": auth_row["case_number"],
         "legal_authority": auth_row["legal_authority"],
         "purpose": auth_row["purpose"],
@@ -186,9 +201,12 @@ def verify_authorization(conn, auth_row):
     if not approver["signing_pub"]:
         return False, "approver has no signing key on record"
 
+    if approver["signing_key_revoked_at"]:
+        return False, "the approver's signing key has been revoked"
     statement = build_statement(
         auth_row, requester["username"], approver["username"],
-        auth_row["approved_at"], auth_row["approval_expires_at"])
+        auth_row["approved_at"], auth_row["approval_expires_at"],
+        approver_key_id=sealing.key_id(approver["signing_pub"]))
     if not verify_statement(approver["signing_pub"], statement,
                             auth_row["approval_signature"]):
         return False, "approval signature does not match this authorization"
@@ -202,7 +220,8 @@ def approval_receipt(conn, auth_row):
     requester = models.get_user_by_id(conn, auth_row["requested_by"])
     statement = build_statement(
         auth_row, requester["username"], approver["username"],
-        auth_row["approved_at"], auth_row["approval_expires_at"])
+        auth_row["approved_at"], auth_row["approval_expires_at"],
+        approver_key_id=sealing.key_id(approver["signing_pub"]))
     return {
         "statement": statement,
         "signature": auth_row["approval_signature"],
