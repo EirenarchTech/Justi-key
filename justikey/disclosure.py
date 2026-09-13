@@ -408,12 +408,7 @@ def service_for(conn, db_path):
         return None
 
     if config.DISCLOSURE_URL:
-        if not config.DISCLOSURE_CLIENT_SECRET:
-            raise DisclosureError(
-                "a disclosure service is configured but no client secret is set; "
-                "set JUSTIKEY_DISCLOSURE_CLIENT_SECRET")
-        return RemoteDisclosureService(config.DISCLOSURE_URL, config.DISCLOSURE_CLIENT_ID,
-                                       config.DISCLOSURE_CLIENT_SECRET)
+        return remote_client()
 
     private_hex = load_private_key(db_path)
     if private_hex is None:
@@ -424,6 +419,24 @@ def service_for(conn, db_path):
                              crypto_store.resolve_index_key(db_path),
                              local_approver_registry(conn),
                              usage=UsageStore(db_path))
+
+
+def remote_client():
+    """The client for a configured disclosure service.
+
+    Deliberately not gated on the store's encryption mode, unlike
+    `service_for`. Scope tokens are needed *during* a migration, while meta
+    still says v1, so a client that existed only for a v3 store would make the
+    migration impossible in the very configuration it targets.
+    """
+    if not config.DISCLOSURE_URL:
+        raise DisclosureError("no disclosure service is configured")
+    if not config.DISCLOSURE_CLIENT_SECRET:
+        raise DisclosureError(
+            "a disclosure service is configured but no client secret is set; "
+            "set JUSTIKEY_DISCLOSURE_CLIENT_SECRET")
+    return RemoteDisclosureService(config.DISCLOSURE_URL, config.DISCLOSURE_CLIENT_ID,
+                                   config.DISCLOSURE_CLIENT_SECRET)
 
 
 def local_approver_registry(conn):

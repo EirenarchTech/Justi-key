@@ -158,6 +158,18 @@ signature, there is no key, so there is no plaintext.
    `resolve_index_key()` now refuses outright in remote mode. See
    [threat-model.md](threat-model.md) finding 1 for the residual that
    remains.
+   Migrating an existing v1 store into this arrangement is a ceremony rather
+   than a command, because its last step destroys a key that opens every
+   record: `scripts/seal_store.py plan | migrate | verify | rekey-credentials
+   | destroy-legacy-key`. Building it turned up two things the design had not
+   accounted for. The v1 root key also protects TOTP secrets and sensor
+   signing secrets, so destroying it after sealing the observations would lock
+   every user out of their second factor. And the ceremony can only be
+   completed against a separated service: in local mode the blind-index key is
+   derived from the data key, so rotating that key orphans every stored index
+   and the archive cannot be repaired, because repairing it would mean opening
+   records the application can no longer open.
+
 4. **Hardware custody.** Approver keys on smartcards; disclosure key in an
    HSM or KMS that enforces the policy check itself.
 

@@ -119,7 +119,7 @@ scripts/
   edge_agent.py     device-side recognition with store-and-forward buffering
   encrypt_store.py  migrate a plaintext database to encryption at rest
   enforce_retention.py delete observations past their retention period
-  seal_store.py     migrate a v1 database to per-record sealing
+  seal_store.py     the v1 -> v3 migration ceremony, step by step
   disclosure_server.py the disclosure service, as its own process and principal
   verify_audit.py   independent verifier: chain + anchors + witness
 
@@ -233,7 +233,7 @@ and it cuts both ways.
 
 Migrating v1 → v3 is a different and heavier operation, because it ends with
 destroying a key that currently opens everything. It is a ceremony, not a
-command, and is documented separately.
+command: see [Migrating v1 -> v3](#migrating-v1---v3-a-ceremony-not-a-command).
 
 ### Residual exposure under v1, stated plainly
 
@@ -382,15 +382,54 @@ with the disclosure key removed : The disclosure service is unavailable, so thes
 key restored                    : Disclosed records (1)
 ```
 
-**Migrating a v1 database:**
+### Migrating v1 -> v3: a ceremony, not a command
+
+The last step of this migration destroys a key that currently opens every
+record, so it is not one command. Each step is separate, checkable, and
+recorded:
 
 ```bash
-python3 scripts/seal_store.py --db justikey.db            # dry run
-python3 scripts/seal_store.py --db justikey.db --apply
+python3 scripts/seal_store.py plan --db justikey.db
+python3 scripts/seal_store.py migrate --db justikey.db --approver supervisor1
+python3 scripts/seal_store.py verify --db justikey.db
+python3 scripts/seal_store.py rekey-credentials --db justikey.db
+python3 scripts/seal_store.py destroy-legacy-key --db justikey.db \
+    --confirm "destroy the legacy key for justikey.db"
 ```
 
-Then move the private key off the host (`JUSTIKEY_DISCLOSURE_KEY`). Once
-sealed, losing it loses the archive.
+`migrate` reseals every observation under its own key, rebuilds every blind
+index (the index key changes with the format), and then opens a sample back
+out **through the real disclosure path** — search, scope check, service,
+envelope — comparing each one against what went in. A migration that wrote an
+index the search path cannot reproduce would leave a store that is intact,
+verified by every other measure, and permanently unfindable; this is the
+check that catches it. It runs while the legacy key is still there, so a
+failure is recoverable.
+
+Each step appends to a manifest (`<db>.ceremony.json`): counts before and
+after, a digest over every sealed record, the disclosure key id, what the
+sample check proved, and key fingerprints. The manifest is a convenience, not
+the evidence — its digest goes into the hash-chained audit ledger at every
+step, so an altered manifest is detectable against a chain that is itself
+externally anchored.
+
+**Two things building this turned up.** First, the v1 root key does not only
+protect observations: users' TOTP secrets and sensors' HMAC signing secrets
+hang off it too. Sealing the observations moves only the first out of its
+reach, so destroying the key at that point would lock every user out of their
+second factor and break every signed feed. Hence `rekey-credentials`, which
+moves that material onto a fresh key, and hence `destroy-legacy-key`
+refusing until it has been run.
+
+Second, the ceremony can only *finish* against a separated disclosure
+service. In local mode the application derives the blind-index key from the
+same root as the data key, so rotating that root silently rotates the index
+key and orphans every stored index — and repairing it would mean resealing
+every record, which requires opening them, which under v3 the application
+cannot do. `rekey-credentials` checks for that coupling and refuses rather
+than producing a store that verifies clean and can never be searched again.
+Standing up the service is not an optional hardening step here; it is what
+makes the last two steps possible.
 
 ## Limits enforced in software, not policy
 

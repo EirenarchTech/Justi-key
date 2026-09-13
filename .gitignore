@@ -25,3 +25,9 @@ captures/
 disclosure-audit.db
 approvers.json
 service.key
+
+# Migration ceremony manifests. They name key fingerprints and record
+# counts, not plates, but they describe a specific deployment.
+*.ceremony.json
+*.data-key.legacy
+*.data-key.new

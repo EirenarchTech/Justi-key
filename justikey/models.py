@@ -180,7 +180,7 @@ def scope_token(conn, plate):
     from . import disclosure
     if disclosure.is_remote():
         if not conn._index_client:
-            conn._index_client = disclosure.service_for(conn, conn.db_path or "")
+            conn._index_client = disclosure.remote_client()
         return conn._index_client.blind_index(plate)
     return cipher_for(conn).blind_index(plate)
 
