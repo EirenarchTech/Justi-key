@@ -693,6 +693,13 @@ its memory. `CiphertextForRecipient` is a CMS `EnvelopedData` (RFC 5652) —
 RSA-OAEP-SHA-256 over a content key, AES-256-CBC content — and the stand-in
 produces genuine DER so the parser is tested against the real format.
 
+**Deploying it:** [nitro-deployment-runbook.md](docs/nitro-deployment-runbook.md)
+covers the parent instance, the EIF build and its PCR measurements, the KMS
+key policy pinned to `kms:RecipientAttestation:ImageSha384`, vsock-proxy, and
+twelve acceptance gates that must pass before real plate data goes behind it
+— including the three (modified EIF denied, parent direct call denied,
+`SharedSecret` empty) that no local test can answer.
+
 **Not built:** the NSM attestation request needs the device; the vsock round
 trip needs a kernel with vsock routing (this one binds listeners but has no
 `vsock_loopback`); the KMS behaviour is exercised against a stand-in

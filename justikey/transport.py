@@ -162,6 +162,31 @@ class VsockTransport:
         return reply, 200
 
 
+def for_url(url, client_id=None, client_secret=None, timeout=None):
+    """Pick a transport from the URL scheme.
+
+        vsock://16:8091          the enclave at CID 16, port 8091
+        http://host:8091         development
+
+    The scheme is the whole configuration difference between a development
+    deployment and a Nitro one, deliberately: nothing above this line should
+    have to know which it is talking to.
+    """
+    text = (url or "").strip()
+    if text.startswith("vsock://"):
+        location = text[len("vsock://"):].strip("/")
+        cid, _, port = location.partition(":")
+        if not cid or not port:
+            raise TransportError(
+                f"malformed vsock address {url!r}; expected vsock://<cid>:<port>")
+        try:
+            return VsockTransport(int(cid), int(port), timeout)
+        except ValueError as exc:
+            raise TransportError(
+                f"malformed vsock address {url!r}: {exc}") from exc
+    return HttpTransport(text, client_id, client_secret, timeout)
+
+
 class HttpTransport:
     """Talks to a custodian over HTTP. Development and process tests."""
 

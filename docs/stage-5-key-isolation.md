@@ -380,6 +380,19 @@ deployment rather than another stand-in. The v3 → v4 reseal is available
 through the existing ceremony but has not been run against a production
 store.
 
+## Deploying it
+
+[nitro-deployment-runbook.md](nitro-deployment-runbook.md) is the executable
+version of this design: parent instance, EIF build and PCR measurements, the
+KMS key policy pinned to the measurement, vsock-proxy, credential placement,
+and twelve acceptance gates.
+
+Three of those gates — modified EIF denied, parent direct call denied,
+`SharedSecret` empty on an attested response — are assertions about AWS, and
+no local test can answer them. They are the difference between a custodian
+and an expensive proxy, which is why the runbook says to stop if either of
+the last two does not behave as documented.
+
 ## Decided
 
 AWS KMS, P-256, `jk-seal-v4`, with Nitro attestation as the production

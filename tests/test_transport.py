@@ -239,6 +239,32 @@ class TestVsockItself(unittest.TestCase):
         self.assertEqual(client.cid, 3)
 
 
+class TestTransportSelection(unittest.TestCase):
+    """The URL scheme is the whole configuration difference between a
+    development deployment and a Nitro one."""
+
+    def test_a_vsock_url_selects_the_vsock_transport(self):
+        chosen = transport.for_url("vsock://16:8091")
+        self.assertEqual(chosen.name, "vsock")
+        self.assertEqual((chosen.cid, chosen.port), (16, 8091))
+
+    def test_an_http_url_selects_the_http_transport(self):
+        chosen = transport.for_url("http://127.0.0.1:8091", "app", "secret")
+        self.assertEqual(chosen.name, "http")
+
+    def test_a_malformed_vsock_address_is_refused(self):
+        for bad in ("vsock://", "vsock://16", "vsock://x:y", "vsock://16:"):
+            with self.subTest(bad):
+                with self.assertRaises(transport.TransportError):
+                    transport.for_url(bad)
+
+    def test_the_client_takes_the_transport_from_the_url(self):
+        from justikey import custodian
+
+        client = custodian.RemoteCustodian(url="vsock://16:8091")
+        self.assertEqual(client.transport.name, "vsock")
+
+
 class TestTheProductionInvariant(unittest.TestCase):
     """An attested custodian must refuse to start a TCP listener.
 

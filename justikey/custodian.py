@@ -114,7 +114,7 @@ class RemoteCustodian:
         if transport is None:
             if not url:
                 raise CustodianError("a custodian needs a transport or a URL")
-            transport = _transport.HttpTransport(url, client_id, client_secret, timeout)
+            transport = _transport.for_url(url, client_id, client_secret, timeout)
         self.transport = transport
         self._key_info = None
 
