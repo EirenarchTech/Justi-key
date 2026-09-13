@@ -39,6 +39,8 @@ import hmac
 import json
 import secrets
 import sys
+import threading
+from datetime import timedelta
 from urllib import error, request
 
 from . import approvals, config, crypto_store, sealing, timeutil
@@ -80,16 +82,113 @@ def request_signature(secret, timestamp, nonce, body):
 # The service itself
 # ---------------------------------------------------------------------------
 
+class UsageStore:
+    """Persistent per-approval disclosure counter, owned by the key holder.
+
+    The application also keeps a count, but a compromised application simply
+    would not call the code that maintains it -- it can talk to /disclose
+    directly with a legitimate signed approval lifted from the database. So
+    the limit has to be enforced here, in the domain that holds the key, and
+    it has to survive a restart.
+
+    Keyed by the approval's nonce: one signed authorization, usable N times,
+    counted by the trusted side, closed permanently at expiry.
+    """
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+
+    def _connect(self):
+        from . import db
+        return db.get_connection(self.db_path)
+
+    def claim(self, nonce, authorization_id, expires_at, limit):
+        """Consume one use of an approval. Returns (ok, count, reason).
+
+        Read and increment happen inside one BEGIN IMMEDIATE transaction, so
+        concurrent requests cannot both observe count 25 and both proceed.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT disclosure_count, expires_at FROM authorization_usage "
+                    "WHERE nonce=?", (nonce,)).fetchone()
+                now = timeutil.now_iso()
+                if row is not None and now > row["expires_at"]:
+                    conn.execute("COMMIT")
+                    return False, row["disclosure_count"], "approval has expired"
+                count = row["disclosure_count"] if row else 0
+                if limit > 0 and count >= limit:
+                    conn.execute("COMMIT")
+                    return False, count, (
+                        f"this approval has already been used {count} times; "
+                        f"the limit is {limit}")
+                if row is not None:
+                    conn.execute(
+                        "UPDATE authorization_usage SET disclosure_count=?, last_used_at=? "
+                        "WHERE nonce=?", (count + 1, now, nonce))
+                else:
+                    conn.execute(
+                        "INSERT INTO authorization_usage (nonce, authorization_id, "
+                        "disclosure_count, expires_at, first_used_at, last_used_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (nonce, authorization_id, 1, expires_at, now, now))
+                conn.execute("COMMIT")
+                return True, count + 1, None
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+
+    def claim_transport_nonce(self, nonce, window_seconds):
+        """Spend a transport nonce once, so an authenticated request that was
+        captured cannot simply be resent inside the clock window."""
+        conn = self._connect()
+        try:
+            cutoff = timeutil.to_canonical(
+                timeutil.now() - timedelta(seconds=window_seconds * 2))
+            conn.execute("DELETE FROM transport_nonces WHERE seen_at < ?", (cutoff,))
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO transport_nonces (nonce, seen_at) VALUES (?,?)",
+                (nonce, timeutil.now_iso()))
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    def purge_expired(self):
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM authorization_usage WHERE expires_at < ?",
+                         (timeutil.now_iso(),))
+        finally:
+            conn.close()
+
+
 class DisclosureService:
     """Holds the private key and the index key. Opens only what an approval covers."""
 
-    def __init__(self, opener, index_key, approver_registry=None):
+    def __init__(self, opener, index_key, approver_registry=None, usage=None,
+                 max_disclosures=None):
         self._opener = opener
         self._index_key = index_key
         # username -> {"public_key": hex, "revoked": bool}. Held by the
         # service, never supplied by the caller.
         self.approvers = approver_registry or {}
-        self._spent_nonces = {}
+        self._usage = usage
+        self.max_disclosures = (config.MAX_DISCLOSURES_PER_AUTHORIZATION
+                                if max_disclosures is None else max_disclosures)
+        # One service object serves concurrent requests, so the count from the
+        # most recent claim is kept per-thread rather than on the instance:
+        # two disclosures in flight must not report each other's number.
+        self._local = threading.local()
+
+    @property
+    def last_use_count(self):
+        """Uses spent by the approval this thread most recently disclosed on."""
+        return getattr(self._local, "use_count", None)
 
     # -- scope tokens ----------------------------------------------------
 
@@ -139,18 +238,6 @@ class DisclosureService:
             raise DisclosureError("approval is dated in the future")
         return public_hex
 
-    def _claim_nonce(self, statement):
-        """One approval nonce may not be replayed after it expires.
-
-        Bounded by expiry: a spent nonce is forgotten once the approval it
-        belongs to could no longer be used anyway.
-        """
-        now = timeutil.now_iso()
-        for nonce, expires in list(self._spent_nonces.items()):
-            if expires < now:
-                del self._spent_nonces[nonce]
-        self._spent_nonces[statement["nonce"]] = statement["approval_expires_at"]
-
     # -- the operation ----------------------------------------------------
 
     def disclose(self, rows, statement, signature_hex, requester):
@@ -158,6 +245,18 @@ class DisclosureService:
         self.verify_approval(statement, signature_hex)
         if statement["requester"] != requester:
             raise DisclosureError("this approval belongs to another requester")
+
+        # Consume a use before opening anything. A compromised application can
+        # present a genuine approval repeatedly; the count that stops it has to
+        # live here rather than in the caller that chose to send the request.
+        if self._usage is not None:
+            ok, count, reason = self._usage.claim(
+                statement["nonce"], statement.get("authorization_id"),
+                statement["approval_expires_at"], self.max_disclosures)
+            if not ok:
+                self._local.use_count = None
+                raise DisclosureError(reason)
+            self._local.use_count = count
 
         target_index = self.blind_index(statement["target_plate"])
         window_start, window_end = statement["window_start"], statement["window_end"]
@@ -172,7 +271,6 @@ class DisclosureService:
                                        row["plate_index"])
             revealed.append({"id": row["id"], "plate": fields.get("plate"),
                              "location": fields.get("location")})
-        self._claim_nonce(statement)
         return revealed
 
 
@@ -324,7 +422,8 @@ def service_for(conn, db_path):
             "set JUSTIKEY_DISCLOSURE_KEY or point at a disclosure service")
     return DisclosureService(sealing.RecordOpener(private_hex),
                              crypto_store.resolve_index_key(db_path),
-                             local_approver_registry(conn))
+                             local_approver_registry(conn),
+                             usage=UsageStore(db_path))
 
 
 def local_approver_registry(conn):

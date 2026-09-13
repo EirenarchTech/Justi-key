@@ -142,7 +142,27 @@ tests/
   test_sealing.py     envelope binding, scoped disclosure, index-key withholding
 ```
 
-## Encryption at rest
+## Storage formats: v1, v2, v3
+
+How an observation is protected at rest has changed three times, and the
+differences are not cosmetic — they are different answers to *who can read
+this*. A database records which format it uses in `meta.encryption_mode`, and
+`crypto_store.encryption_mode(conn)` reports it. **New databases are created
+as v3.**
+
+| Mode | Protection | Who can read a stored plate |
+|---|---|---|
+| `none` | plaintext columns | anyone with the file |
+| `v1` | AES-256-GCM fields, one root key held by the application | the application, at will |
+| `v2` | per-record sealing under a disclosure public key | only the disclosure key holder — in `local` mode, still this process |
+| `v3` | v2 plus full envelope binding, with the index key moved out of the application | only the separate disclosure service |
+
+The rest of this section describes v1, because a database created before the
+split still uses it and the migration path has to be documented. For how v2
+and v3 actually work, see [Per-record sealing](#per-record-sealing-the-application-cannot-read-what-it-collects)
+and [Running the service separately](#running-the-service-separately-stage-3).
+
+### Legacy v1 encryption architecture
 
 Every other control in JustiKey governs *access*: who asked, who approved,
 how narrow the scope was. None of them help if someone simply takes the
@@ -150,12 +170,12 @@ database file. A stolen backup, a decommissioned disk, or a copied volume
 would yield the entire location history with no authorization, no approval,
 and no audit entry -- defeating every control at once.
 
-Plate and location values, and TOTP secrets, are therefore stored as
-AES-256-GCM ciphertext (`justikey/crypto_store.py`). Exact-plate search still
-works because each observation also carries a **blind index**: a keyed HMAC
-of the normalized plate. Lookups match on the index, so the query never
-handles plaintext; values are decrypted only for rows the policy engine has
-already authorized.
+v1 answers exactly that threat and no other. Plate and location values, and
+TOTP secrets, are stored as AES-256-GCM ciphertext
+(`justikey/crypto_store.py`). Exact-plate search still works because each
+observation also carries a **blind index**: a keyed HMAC of the normalized
+plate. Lookups match on the index, so the query never handles plaintext;
+values are decrypted only for rows the policy engine has already authorized.
 
 Two keys, derived from one root by HKDF with distinct labels, so the index
 key can never decrypt and the encryption key can never build lookup values:
@@ -171,6 +191,17 @@ different time to fabricate a sighting -- the tag check fails. A wrong key is
 detected at startup against a stored canary and refused, rather than silently
 writing records that can never be read back.
 
+**Why this is not enough, and what v3 changes.** Both keys come from one
+root, and the application holds that root. So a compromised application can
+decrypt every record, and — worse — can derive the index key and enumerate
+the plate space offline: plates are low-entropy enough that a measured run
+recovered three of them in 23.7 seconds. Under v3 the application holds
+neither key. It seals against a public key it cannot invert, asks the
+disclosure service for scope tokens over an authenticated, rate-limited,
+logged channel, and `crypto_store.resolve_index_key()` refuses outright to
+produce an index key in remote mode. See
+[threat-model.md](docs/threat-model.md) finding 1.
+
 ### Key custody is the whole point
 
 A key sitting beside the database protects against a stolen file and nothing
@@ -184,7 +215,7 @@ JUSTIKEY_DATA_KEY=$(openssl rand -hex 32) python3 scripts/run_server.py
 The generated `*.data-key` file is a development fallback and says so on
 stderr every time it is created.
 
-### Migrating an existing database
+### Migrating `none` → v1
 
 A database created before encryption holds plaintext. `init_db` deliberately
 will **not** switch it over on its own -- a half-encrypted store is worse
@@ -200,17 +231,30 @@ Back up first, and be sure the key is one you will still have tomorrow.
 Losing it means losing every protected record; that is what encryption means,
 and it cuts both ways.
 
-### Residual exposure, stated plainly
+Migrating v1 → v3 is a different and heavier operation, because it ends with
+destroying a key that currently opens everything. It is a ceremony, not a
+command, and is documented separately.
+
+### Residual exposure under v1, stated plainly
+
+Listed for the sake of anyone still running a v1 database. The first two
+carry over to v3; the third and fourth are what the split removes.
 
 - **The blind index is deterministic.** An attacker holding the database can
   tell that two rows concern the same (still unknown) vehicle and count how
   often it was seen. That is inherent to searchable encryption; removing it
-  would mean giving up authorized lookup entirely.
+  would mean giving up authorized lookup entirely. *(Carries over to v3.)*
 - **camera_id and captured_at stay plaintext.** They are needed to operate
   the system and to bind the AAD. With the blind index they reveal movement
-  patterns of an unidentified vehicle, not its identity.
+  patterns of an unidentified vehicle, not its identity. *(Carries over to
+  v3.)*
 - **A running server holds the key.** This protects data at rest, not against
-  a live host compromise.
+  a live host compromise. *(Removed in v3: the application holds only a
+  public key.)*
+- **The index key is derivable from the data key**, so a compromised
+  application can enumerate the plate space offline and silently. *(Removed
+  in v3: the index key lives in the disclosure service and is never derived
+  in the application.)*
 
 ## Approver-signed authorizations
 
@@ -291,7 +335,7 @@ approval covers.
 python3 scripts/disclosure_server.py --port 8090 \
     --key-file service.key --index-key "$INDEX_KEY" \
     --client-secret "$CLIENT_SECRET" --approvers approvers.json \
-    --ledger disclosure-audit.db
+    --ledger disclosure-audit.db --max-disclosures 25
 ```
 
 The application then gets the public key and the client secret, and **neither
@@ -313,11 +357,15 @@ arbitrary SQL, code execution:
 | Find a disclosure private key on the host | none present |
 | Derive the index key and enumerate offline | refused |
 | Forge an approval with an attacker's key | refused: the service holds its own approver registry |
+| Replay a captured authenticated request | refused: transport nonces are spent once |
+| Reuse a genuine approval past its cap | refused: the service counts uses, not the caller |
 
 The service keeps its own hash-chained ledger, and its writes are serialized
 so concurrent disclosures cannot fork the chain. It deliberately does not log
 the plate in a scope-token request: doing so would rebuild the archive it
-exists to protect.
+exists to protect. The same database holds the state the service owns rather
+than trusts: how many times each approval has been spent, and which transport
+nonces have been seen.
 
 In `local` mode (no `JUSTIKEY_DISCLOSURE_URL`) the private key and index key
 live in the application process, so the split is structural rather than
@@ -352,7 +400,7 @@ architecture. These were previously human expectations only:
 | Control | Setting | Default |
 |---|---|---|
 | Maximum authorization time window | `JUSTIKEY_MAX_WINDOW_DAYS` | 90 days |
-| Disclosures per approval | `JUSTIKEY_MAX_DISCLOSURES` | 25 |
+| Disclosures per approval | `JUSTIKEY_MAX_DISCLOSURES` / `--max-disclosures` | 25 |
 | Failed sign-ins before lockout | `JUSTIKEY_MAX_FAILED_LOGINS` | 5 |
 | Lockout duration | `JUSTIKEY_LOCKOUT_SECONDS` | 900 |
 | Observation retention | `JUSTIKEY_RETENTION_DAYS` | 365 days |
@@ -363,7 +411,23 @@ only at creation could be bypassed by any path that edits an authorization
 afterwards.
 
 **Disclosure cap.** One approval no longer authorizes unlimited re-querying
-inside its window.
+inside its window — and the count that enforces that is kept by the
+*disclosure service*, not by the application. This matters because the
+application is the component assumed compromised: it holds every approval
+row, so it can replay a genuine signed approval straight at `/disclose` and
+never run its own check. The service claims a use from
+`disclosure.UsageStore` — keyed by the approval's nonce, inside a
+`BEGIN IMMEDIATE` transaction, in its own database — before it opens
+anything, so attempt 26 is refused whatever the caller says about the first
+25, restarts do not reset the count, and concurrent requests cannot both slip
+past the last slot. The application keeps its own count too, but only so the
+honest path can refuse early with a specific message.
+
+A signed request to the service is also single-use: `X-JustiKey-Nonce` is
+spent once, so a captured authenticated request cannot be resent inside the
+clock-skew window. See [threat-model.md](docs/threat-model.md) finding 5 for
+what remains — within a live approval's scope, window and remaining count, a
+compromised application can still act in a requester's name.
 
 **Oversight is itself audited.** Reading the audit log and running an
 integrity check are recorded. The ledger names every plate ever

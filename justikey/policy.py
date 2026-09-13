@@ -83,6 +83,12 @@ def evaluate_disclosure(conn, auth_id, requested_plate, actor_user):
         if not unsigned or config.REQUIRE_SIGNED_APPROVALS:
             return False, "approval_signature_invalid", []
 
+    # Advisory, not authoritative. A compromised application simply would not
+    # run this check -- it can call /disclose directly with an approval lifted
+    # from the database. The count that actually stops the 26th disclosure is
+    # kept by the disclosure service (disclosure.UsageStore), in the domain
+    # that holds the key. This one exists so the honest path refuses early and
+    # with a message that names the reason.
     limit = config.MAX_DISCLOSURES_PER_AUTHORIZATION
     if limit > 0 and auth_row["disclosure_count"] >= limit:
         return False, "disclosure_limit_reached", []

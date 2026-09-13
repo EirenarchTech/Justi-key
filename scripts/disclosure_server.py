@@ -26,6 +26,13 @@ append-only, hash-chained ledger before a response is returned:
     POST /index       a scope token for one plate (rate limited, recorded)
     POST /disclose    open the records an approval covers
 
+AUTHORIZATION USAGE
+
+The cap on how many times one approval may be spent lives here, not in the
+application. The service keeps `approval nonce -> disclosure count -> expiry`
+in its own ledger database and updates it atomically before opening anything,
+so attempt 26 is refused whatever the caller claims about the first 25.
+
 APPROVER ENROLMENT
 
 Approver public keys live here, in --approvers, not in the request. A
@@ -64,6 +71,28 @@ CREATE TABLE IF NOT EXISTS audit_log (
     hash TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+-- How often each approval has actually been spent. The application asks for
+-- disclosures; this service decides whether one is still owed. Keeping the
+-- count here means a compromised application calling /disclose directly,
+-- with a genuine signed approval, still runs out.
+CREATE TABLE IF NOT EXISTS authorization_usage (
+    nonce TEXT PRIMARY KEY,
+    authorization_id INTEGER,
+    disclosure_count INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT NOT NULL,
+    first_used_at TEXT NOT NULL,
+    last_used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_authorization_usage_expiry ON authorization_usage(expires_at);
+
+-- Transport nonces, spent once each, so a captured authenticated request
+-- cannot simply be resent inside the clock-skew window.
+CREATE TABLE IF NOT EXISTS transport_nonces (
+    nonce TEXT PRIMARY KEY,
+    seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transport_nonces_seen ON transport_nonces(seen_at);
 """
 
 STATE = {}
@@ -158,6 +187,14 @@ class Handler(BaseHTTPRequestHandler):
             record("client_auth_failed", f"client:{client[:64]}", {"reason": "bad signature"})
             self._json(401, {"error": "invalid client signature"})
             return None
+        # A valid signature is not enough: the whole request, headers included,
+        # stays valid for the clock window, so anyone who captured one could
+        # replay it verbatim. Each nonce is spendable once.
+        if not STATE["usage"].claim_transport_nonce(nonce, CLOCK_SKEW_SECONDS):
+            record("transport_replay_refused", f"client:{client[:64]}",
+                   {"reason": "request nonce already spent"})
+            self._json(401, {"error": "request nonce has already been used"})
+            return None
         return body
 
     # -- routes -----------------------------------------------------------
@@ -233,6 +270,8 @@ class Handler(BaseHTTPRequestHandler):
             "case": statement.get("case_number"),
             "authorization_id": statement.get("authorization_id"),
             "approver": statement.get("approver"),
+            "use_count": STATE["service"].last_use_count,
+            "use_limit": STATE["service"].max_disclosures,
             "candidates": len(rows), "opened": len(opened)})
         self._json(200, {"opened": opened})
 
@@ -268,6 +307,8 @@ def main():
                         help="this service's own append-only ledger")
     parser.add_argument("--index-limit", type=int, default=600,
                         help="scope tokens per minute; 0 disables the limit")
+    parser.add_argument("--max-disclosures", type=int, default=None,
+                        help="times one approval may be spent; 0 disables the cap")
     args = parser.parse_args()
 
     private_hex = args.key
@@ -290,20 +331,26 @@ def main():
     STATE["ledger"] = args.ledger
     STATE["client_secret"] = args.client_secret
     STATE["index_limit"] = args.index_limit
+    STATE["usage"] = disclosure.UsageStore(args.ledger)
+    STATE["usage"].purge_expired()
     STATE["service"] = disclosure.DisclosureService(
         sealing.RecordOpener(private_hex),
         bytes.fromhex(args.index_key),
-        load_approvers(args.approvers))
+        load_approvers(args.approvers),
+        usage=STATE["usage"],
+        max_disclosures=args.max_disclosures)
 
     opener = STATE["service"]._opener
     record("service_started", "disclosure-service", {
-        "key_id": opener.key_id, "approvers": sorted(STATE["service"].approvers)})
+        "key_id": opener.key_id, "approvers": sorted(STATE["service"].approvers),
+        "max_disclosures": STATE["service"].max_disclosures})
 
     print(f"JustiKey disclosure service on http://{args.host}:{args.port}")
     print(f"  public key : {opener.public_hex}")
     print(f"  key id     : {opener.key_id}")
     print(f"  approvers  : {', '.join(sorted(STATE['service'].approvers)) or '(none enrolled)'}")
     print(f"  ledger     : {args.ledger}")
+    print(f"  use cap    : {STATE['service'].max_disclosures or 'unlimited'} per approval")
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()

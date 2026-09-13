@@ -68,6 +68,8 @@ SQL, code execution — the following hold and are tested:
 | Derive the index key and enumerate offline | refused |
 | Forge an approval with an attacker-controlled key | refused: the service holds its own approver registry |
 | Grind the index through `/index` | possible, rate limited, logged (finding 1) |
+| Replay a captured authenticated request | refused: transport nonces are spent once |
+| Reuse a genuine live approval at `/disclose` | possible within its scope, window and remaining count; capped and logged by the service (finding 5) |
 
 The precise claim this supports is: **the application cannot decrypt stored
 observations after ingestion.** It is *not* "the application never has access
@@ -90,7 +92,54 @@ last month or for tomorrow. **Residual:** an application compromised at the
 moment of signing can misuse that moment. Stage 4 (smartcard / WebAuthn)
 closes it.
 
-## 5. Record transplantation
+## 5. Active authorization abuse — the residual inside a valid approval
+
+The controls in section 4 stop an attacker *minting* an approval. They do
+nothing about one that already exists. A fully compromised application holds
+the database, so it holds every approval row: statement, signature, nonce and
+all. It can replay a genuine, unexpired, correctly signed approval belonging
+to officer1 straight at `/disclose`, sending `requester="officer1"`, and the
+service will honour it — because from the service's side that request is
+indistinguishable from the real one. Nothing in the protocol proves officer1
+is at a keyboard.
+
+So the honest statement is: **an approval is a bearer capability for as long
+as it is live.** What stops it from being an unlimited one is that the
+service, not the application, decides how far it goes.
+
+| Bound | Where it is enforced |
+|---|---|
+| Scope: this plate, this window, nothing else | service, re-derived from the signed statement |
+| Lifetime: until `approval_expires_at` | service, checked per request and again in the usage store |
+| Count: N disclosures, 25 by default | service (`disclosure.UsageStore`), one row per approval nonce |
+| Visibility: every use lands in the service's ledger | service, written before the response |
+
+The count is the one that changed most recently, and it changed because the
+earlier arrangement did not survive this threat. The cap lived in
+`policy.evaluate_disclosure()` — in the application, the very component
+assumed compromised — and a nonce was written to an in-process dictionary
+that nothing ever read. Calling `disclose()` directly opened records 60 times
+against a configured cap of 25, and a restart reset even that. The count now
+lives in the service's own database, is claimed inside a `BEGIN IMMEDIATE`
+transaction before anything is opened, and survives restarts; the
+application's copy is advisory, kept only so the honest path can refuse early
+with a specific message.
+
+A second, smaller version of the same problem is at the transport layer: an
+authenticated request stays valid for the whole clock-skew window, so a
+captured one could be resent verbatim. Each `X-JustiKey-Nonce` is now spent
+once, in a separate namespace from approval nonces, and reuse is a 401 and a
+`transport_replay_refused` ledger entry.
+
+**What is still open.** Within a live approval's scope, window and remaining
+count, a compromised application can obtain the plates that approval covers,
+attributed to the requester who is not there. Narrowing it further needs a
+requester-held key: proof-of-presence at disclosure time, not only at
+approval time, so the service can tell an officer's request from the
+application's imitation of one. That is stage 4, and it is the reason short
+expiries and small caps are not cosmetic settings.
+
+## 6. Record transplantation
 
 Each envelope authenticates, as AEAD associated data, its format version,
 recipient key id, record uid, capture time, camera id, and blind index. Any
@@ -99,7 +148,7 @@ records fails the tag check. The record uid is generated at seal time rather
 than taken from the row id, which the database — and therefore an attacker
 with SQL — controls.
 
-## 6. Audit integrity
+## 7. Audit integrity
 
 The application and the disclosure service each keep their own hash-chained
 ledger. Appends are serialized (`BEGIN IMMEDIATE`, plus an in-process lock in
@@ -113,7 +162,7 @@ The disclosure ledger deliberately does **not** record the plate involved in
 a scope-token request. Logging it would rebuild the archive the service
 exists to protect.
 
-## 7. Availability as a safety property
+## 8. Availability as a safety property
 
 If the disclosure service is unreachable, lawful access stops. That is
 correct, and it is deliberate: there is no fallback path that opens records

@@ -142,6 +142,16 @@ signature, there is no key, so there is no plaintext.
    time, camera and blind index as AAD, so nothing can be transplanted
    between records.
 
+   The service also owns the state that bounds a live approval, because the
+   application cannot be trusted to bound itself: `approval nonce ->
+   disclosure count -> expiry`, claimed atomically in the service's own
+   database before anything is opened. The cap had been enforced in
+   `policy.evaluate_disclosure()` — inside the component assumed compromised
+   — so calling `disclose()` directly opened records 60 times against a cap
+   of 25. Transport nonces are spent once as well, so a captured
+   authenticated request cannot be replayed inside the clock window. See
+   [threat-model.md](threat-model.md) finding 5.
+
    Building this found that removing the *use* of the index key from the
    application was not enough — it remained derivable from the data key, so a
    compromised application could still enumerate offline.

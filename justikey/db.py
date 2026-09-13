@@ -184,6 +184,28 @@ CREATE TABLE IF NOT EXISTS ingest_nonces (
 );
 CREATE INDEX IF NOT EXISTS idx_ingest_nonces_seen ON ingest_nonces(seen_at);
 
+-- Disclosure usage state, owned by whichever domain holds the disclosure
+-- key. One signed approval (identified by its nonce) may be used a bounded
+-- number of times; the count survives restart and expiry closes it for good.
+CREATE TABLE IF NOT EXISTS authorization_usage (
+    nonce TEXT PRIMARY KEY,
+    authorization_id INTEGER,
+    disclosure_count INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT NOT NULL,
+    first_used_at TEXT NOT NULL,
+    last_used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_authorization_usage_expiry ON authorization_usage(expires_at);
+
+-- Transport nonces for application-to-service requests, separate from
+-- approval nonces: without these, an authenticated request that was captured
+-- can be resent inside the clock-skew window.
+CREATE TABLE IF NOT EXISTS transport_nonces (
+    nonce TEXT PRIMARY KEY,
+    seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transport_nonces_seen ON transport_nonces(seen_at);
+
 -- Per-database settings: encryption mode and the key-check canary.
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
