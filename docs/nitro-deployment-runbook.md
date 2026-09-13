@@ -85,15 +85,39 @@ the KMS key policy will pin.
 
 ```dockerfile
 # Dockerfile.custodian
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:PIN_THIS_DIGEST
 RUN dnf install -y python3 python3-pip && dnf clean all
 RUN pip3 install --no-cache-dir cryptography==41.0.7 boto3
 COPY justikey/ /opt/justikey/justikey/
 COPY scripts/custodian_server.py /opt/justikey/scripts/
+COPY approvers.json requesters.json /opt/justikey/
 WORKDIR /opt/justikey
-# vsock only. The server refuses to start a TCP listener when attested.
-CMD ["python3", "scripts/custodian_server.py", "--transport", "vsock", "--attest"]
+
+# Acceptance-run configuration, baked in. See the warning below: this is a
+# TEST-ONLY arrangement and the values must be throwaway.
+ARG CLIENT_SECRET
+ARG INDEX_KEY
+ARG KMS_KEY_ARN
+ARG PUBLIC_KEY
+ARG AWS_REGION
+
+# vsock only. The server exits 4 if asked to serve TCP while attested, and
+# exits 5 if given an ingest secret while attested.
+CMD python3 scripts/custodian_server.py \
+      --transport vsock --vsock-port 8091 \
+      --attest \
+      --kms-key-arn "$KMS_KEY_ARN" --public-key "$PUBLIC_KEY" \
+      --region "$AWS_REGION" \
+      --client-secret "$CLIENT_SECRET" --index-key "$INDEX_KEY" \
+      --approvers approvers.json --requesters requesters.json \
+      --presence-mode required \
+      --ledger /tmp/custodian-audit.db
 ```
+
+> **The CMD in an earlier draft of this runbook was incomplete** — it named
+> only `--transport vsock --attest`, and an enclave built from it exits
+> immediately with `--client-secret is required`. Verified by running it.
+> Build from the version above.
 
 ```bash
 docker build -t justikey-custodian -f Dockerfile.custodian .
@@ -320,8 +344,40 @@ the enclave's whole view of the internet, and widening it widens that.
 
 ## 5. Credentials, registries and keys
 
-Move these into the enclave at launch (through the enclave's own
-configuration mechanism, not the filesystem — it has none):
+### How configuration reaches the enclave — a gap, stated plainly
+
+`nitro-cli run-enclave` takes an EIF, a CPU count, memory and a CID. **It has
+no way to pass arguments, environment or files to the application inside.**
+An enclave has no persistent storage and no network but vsock. So there are
+exactly two ways for the custodian's client secret and index key to reach it:
+
+1. **Baked into the EIF.** They are then part of the measured image — which
+   means anyone holding the EIF file can extract them, and the PCRs change
+   whenever they rotate.
+2. **Sent over vsock after boot**, by a provisioning step the parent runs
+   before the custodian begins serving.
+
+(2) is what production needs. **JustiKey does not implement it.** The
+runbook previously said configuration arrives "through the enclave's own
+configuration mechanism", which described a thing that does not exist. That
+is a real gap in the deployment story, not in the crypto core.
+
+**For this disposable acceptance run, use (1) with throwaway values.** The
+run is testing whether AWS enforces the attestation boundary, and adding a
+provisioning protocol to the same experiment adds a variable without
+answering that question. Generate a client secret and index key used nowhere
+else, bake them in, destroy the environment afterwards, and record in the
+evidence that configuration was baked — because a production EIF built the
+same way would be shipping its secrets to anyone who can read the file.
+
+Before production, a vsock bootstrap needs building: the custodian listens,
+receives its configuration as its first frame, and only then starts
+answering. The transport layer already frames and bounds messages, so it is
+a new operation rather than a new mechanism.
+
+### What has to reach it
+
+Move these into the enclave (baked, for the acceptance run):
 
 | Item | Where it comes from | Notes |
 |---|---|---|
@@ -378,19 +434,43 @@ next depends on.
 | # | Test | Expected | Evidence |
 |---|---|---|---|
 | 1 | Known-good enclave + valid authorization | **OPEN** | AWS |
-| 2 | Parent calls `DeriveSharedSecret` directly | **AWS DENY** | **AWS only** |
-| 3 | Parent supplies no `Recipient` | **AWS DENY** | **AWS only** |
+| 2 | Parent calls `DeriveSharedSecret` with **no `Recipient`** | **AWS DENY** | **AWS only** |
+| 3 | Parent calls with a **malformed or non-matching** attestation | **AWS DENY** | **AWS only** |
 | 4 | Modified EIF | **AWS DENY** | **AWS only** |
 | 5 | Valid enclave, wrong PCR configured in policy | **AWS DENY** | **AWS only** |
-| 6 | Valid attested operation | `CiphertextForRecipient` populated, `SharedSecret` **empty** | **AWS only** |
-| 7 | Ciphertext delivered to the wrong per-operation RSA key | **REFUSE** | local + AWS |
-| 8 | One approval against every row | exactly one authorized row | local + AWS |
-| 9 | `/index` enumeration from the disclosure side | zero useful tokens | local + AWS |
-| 10 | Forged approval to `search-token` | zero tokens | local + AWS |
-| 11 | Replay presence / approval | **REFUSE** | local + AWS |
-| 12 | Cap race | never exceeds remaining uses | local + AWS |
+| 6 | Valid attested operation | `CiphertextForRecipient` present, `SharedSecret` **absent** | **AWS only** |
+| 7 | Parent **copies a valid attestation document** and calls KMS itself | a response may return; the parent **cannot recover the secret** | **AWS only** |
+| 8 | Ciphertext delivered to the wrong per-operation RSA key | **REFUSE** | local + AWS |
+| 9 | One approval against every row | exactly one authorized row | local + AWS |
+| 10 | `/index` enumeration from the disclosure side | zero useful tokens | local + AWS |
+| 11 | Forged approval to `search-token` | zero tokens | local + AWS |
+| 12 | Replay presence / approval | **REFUSE** | local + AWS |
+| 13 | Cap race | never exceeds remaining uses | local + AWS |
 
-### Tests 2–6 are the whole point
+### Test 7 is not about whether KMS answers
+
+An earlier draft of this runbook had a gate reading *"parent direct call →
+KMS denies"*, which conflated two different things and was wrong.
+
+**KMS authorizes the attestation document. It does not authenticate the
+network process as "the enclave."** A parent that copies a valid attestation
+document out of a request and replays it may well receive a response — and
+that is not a failure, because the response is `CiphertextForRecipient`,
+encrypted to the recipient public key named *in that document*, whose private
+half exists only inside the enclave.
+
+So do not score this test on whether KMS returned something. Score it on the
+invariant that actually matters:
+
+- the response carries **no `SharedSecret`**, and
+- the parent **cannot decrypt `CiphertextForRecipient`**
+
+Attempt the decryption and record the failure. That is the real test of the
+Recipient boundary, and it is why the custodian mints a **fresh RSA keypair
+per operation**: a copied document names a key the parent does not hold, and
+a captured ciphertext has no later operation to be replayed into.
+
+### Tests 2–7 are the whole point
 
 They are the only results that answer the threat-model question this stage
 was opened to settle, and **they have no local equivalent that means
@@ -398,12 +478,12 @@ anything**. `tests/fake_kms.py` implements the documented semantics so the
 JustiKey side is testable; it proves nothing whatever about AWS, because it
 is a program this project wrote to agree with this project.
 
-**Record tests 2–6 separately from the 421 local tests.** They are AWS
+**Record tests 2–7 separately from the 421 local tests.** They are AWS
 evidence. Mixing them into a test-count makes a claim about AWS that a test
 count cannot support, which is the failure mode this whole review has been
 about.
 
-Tests 7–12 have local equivalents that pass
+Tests 8–13 have local equivalents that pass
 (`test_custodian.py`, `test_custodian_process.py`, `test_index_oracle.py`,
 `test_transport.py`). Running them again on AWS confirms the deployment
 wired up what the code does, not that the code does it.
@@ -413,6 +493,8 @@ wired up what the code does, not that the code does it.
 - **2, 3 or 5 pass when they should deny** → the key policy is not doing what
   you think. Check for a default policy granting account root (§3), and check
   the condition landed with `aws kms get-key-policy`.
+- **7 returns a response** → expected; that alone is not a failure. The
+  failure is if the parent can *decrypt* it, or if `SharedSecret` is present.
 - **4 passes when it should deny** → the PCRs in the policy are not this
   EIF's, or the enclave is in debug mode and reporting zeroes (§2).
 - **6 returns a populated `SharedSecret`** → **stop.** That is not the
@@ -426,7 +508,7 @@ Keep it permanently. A gate that passed once, against an EIF whose
 measurements you did not write down, is a gate you will have to run again and
 cannot compare against.
 
-For **each of tests 2–6**, record all seven of these:
+For **each of tests 2–7**, record all seven of these:
 
 | Field | Why it is in the bundle |
 |---|---|
@@ -434,7 +516,7 @@ For **each of tests 2–6**, record all seven of these:
 | KMS key ARN / key id, and the key-policy digest | which policy was actually in force, comparable later |
 | SCP version or digest in effect | the administration boundary is not in the key policy (§3); this records whether the thing that makes it independent existed at the time |
 | request outcome and timestamp | the result, and when |
-| CloudTrail event id for each attempt | the independent record that the denial came from AWS rather than from anything in this repository |
+| CloudTrail event id for each attempt | the independent record that the outcome came from AWS rather than from anything in this repository |
 | on the valid attested path: whether `SharedSecret` was **absent** and `CiphertextForRecipient` **present** | the specific observation that separates a custodian from an expensive proxy |
 | on denied paths: the KMS error code and message | that it denied *for the intended reason*, not incidentally |
 
@@ -448,11 +530,12 @@ And for the run as a whole:
 ```
 run date, operator
 local suite: commit, test count, pass/fail
-tests 1, 7-12: pass/fail
+tests 1, 8-13: pass/fail
 ```
 
-**If tests 2, 3, 4 and 5 deny for the intended reasons and test 6 returns
-only `CiphertextForRecipient`**, that is the first genuinely external
+**If tests 2, 3, 4 and 5 deny for the intended reasons, test 6 returns only
+`CiphertextForRecipient`, and test 7 shows the parent cannot decrypt what it
+receives**, that is the first genuinely external
 evidence in this project that the archive-walking oracle is blocked by a
 boundary outside JustiKey itself. Everything before it is this repository
 agreeing with this repository.

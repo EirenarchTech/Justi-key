@@ -323,6 +323,30 @@ correct, and it is deliberate: there is no fallback path that opens records
 without the service. The policy engine returns `disclosure_unavailable` and
 records stay sealed.
 
+### What the Recipient boundary is, precisely
+
+Worth stating because it is easy to describe wrongly, and an earlier draft of
+the deployment runbook did.
+
+**KMS authorizes the attestation document; it does not authenticate the
+network process as "the enclave."** A compromised parent that copies a valid
+attestation document out of a request and replays it to KMS may receive a
+response. That is not a breach. The response is `CiphertextForRecipient`,
+encrypted to the recipient public key named *in that document*, and the
+private half of that key exists only inside the enclave that generated it.
+
+So the security condition is not "the parent's call is refused". It is:
+
+- the parent never receives `SharedSecret`, and
+- the parent cannot decrypt `CiphertextForRecipient`
+
+which is why the custodian mints a **fresh RSA keypair per KMS operation**: a
+copied document names a key the parent does not hold, and a captured
+ciphertext has no later operation to be replayed into. Both properties are
+enforced in `custodian.KmsAgreement` — a response carrying a populated
+`SharedSecret` alongside a ciphertext is refused outright, because that is
+not the attested path and the plaintext has already reached the parent.
+
 ## A cross-cutting principle
 
 Stated separately because it is not about one finding, and because this
