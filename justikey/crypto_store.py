@@ -178,11 +178,12 @@ def resolve_index_key(db_path):
     In local mode the application does hold it, which is one of the reasons
     local mode is structural rather than enforced.
     """
-    if config.DISCLOSURE_URL:
+    if config.DISCLOSURE_URL or config.CUSTODIAN_URL:
+        holder = "custodian" if config.CUSTODIAN_URL else "disclosure service"
         raise EncryptionError(
-            "the blind-index key belongs to the disclosure service and is not "
-            "available to this application; holding it would permit offline "
-            "enumeration of the plate space")
+            f"the blind-index key belongs to the {holder} and is not available "
+            f"to this application; holding it would permit offline enumeration "
+            f"of the plate space")
     if config.INDEX_KEY_HEX:
         key = bytes.fromhex(config.INDEX_KEY_HEX.strip())
         if len(key) != KEY_BYTES:

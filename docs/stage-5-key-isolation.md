@@ -190,6 +190,75 @@ The third is the one that matters. A live, genuine, correctly signed approval
 naming one vehicle, driven across the entire archive by a fully compromised
 service, yields that one vehicle.
 
+### The custodian as its own process
+
+`scripts/custodian_server.py` runs it as its own process and principal, with
+its own ledger, its own registries, its own index key, and the state it owns
+rather than trusts. Two routes and no third:
+
+```
+POST /index   a scope token, so the custodian can re-derive scope itself
+POST /open    one record, after verifying the whole disclosure context
+```
+
+A test asserts that `/derive`, `/agree`, `/unwrap`, `/key`, `/privatekey` and
+`/decrypt` all return 404 — the oracle restated as a route is the thing being
+avoided.
+
+**`/open` takes one record, not a list.** Batching would let a caller hand
+over the whole table and have the custodian sort out which ones it likes,
+which is convenient and is exactly the oracle's shape. The disclosure service
+still narrows candidates locally; the custodian re-deriving scope per record
+is what makes that narrowing untrusted rather than load-bearing.
+
+**The custodian owns the spending.** When `JUSTIKEY_CUSTODIAN_URL` is set the
+disclosure service stops claiming approval counts and presence nonces — it
+still runs every check it ran before, because a second opinion is the point,
+but two components both *spending* would halve every cap and leave the two
+ledgers disagreeing about what happened. Tested: after one disclosure the
+application's `authorization_usage` table is empty and the custodian's shows
+a count of 1.
+
+**The application holds no private key.** With a custodian configured,
+`service_for` installs a `_PublicOnlyOpener` in the opener's place. It raises
+rather than opening, so a code path that ever reaches it fails loudly instead
+of quietly working.
+
+**Registry versions must agree across the boundary.** The caller states which
+registry versions it used; a mismatch refuses before anything else is
+checked. Neither side opens a record while they disagree about whose keys
+count.
+
+Measured through the real HTTP transport, ten sealed records, one genuine
+approval naming one of them, replayed against every row:
+
+```
+opened: ['SECRET99']
+custodian ledger: 1 open_granted, 9 open_refused, chain verifies
+```
+
+The custodian's ledger records every refusal and **contains no plate** — a
+test asserts none of the ten plate strings appears anywhere in it, because a
+ledger that recorded them would rebuild the archive the custodian exists to
+protect.
+
+### Running it inside an enclave
+
+On AWS Nitro the custodian runs in the enclave and the parent proxies to it
+over vsock; nothing in the server assumes which transport it is behind.
+`--attestation-file` is the enclave's attestation document, sent to KMS as
+`Recipient`.
+
+`GET /publickey` reports `"attested": true|false`, and an unattested
+custodian prints a startup notice saying plainly that the configuration does
+not meet the stage 5 objective. That seemed better than letting a
+development configuration look like a production one.
+
+One piece is deliberately a refusal rather than a stub: decrypting
+`CiphertextForRecipient` requires the enclave's private key and the NSM
+device, so outside an enclave `--attestation-file` raises an error naming
+what is missing rather than silently degrading to an unattested call.
+
 ### Where the evidence stops
 
 Attack 1 is the only control that does not depend on JustiKey's code being
@@ -201,9 +270,11 @@ JustiKey behaves correctly given that behaviour. They are not evidence about
 AWS.** Confirming the real service behaves as documented is a deployment
 step, not a unit test.
 
-Two things also remain unbuilt: the custodian does not yet run as its own
-process behind an enclave, and the v3 → v4 reseal is available through the
-existing ceremony but has not been run against a production store.
+What remains: the enclave-side decryption of `CiphertextForRecipient` (it
+needs the NSM device, so it is a named refusal outside an enclave rather than
+a stub), a vsock transport to replace TCP in production, and the v3 → v4
+reseal, which is available through the existing ceremony but has not been run
+against a production store.
 
 ## Decided
 

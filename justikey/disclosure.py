@@ -254,8 +254,17 @@ class DisclosureService:
     """Holds the private key and the index key. Opens only what an approval covers."""
 
     def __init__(self, opener, index_key, approver_registry=None, usage=None,
-                 max_disclosures=None, requester_registry=None, presence_mode=None):
+                 max_disclosures=None, requester_registry=None, presence_mode=None,
+                 custodian_client=None, registry_versions=None):
         self._opener = opener
+        # When a custodian is configured this service stops being the thing
+        # that opens records. It still checks everything it checked before --
+        # a second opinion is the point -- but the custodian is authoritative,
+        # and crucially it is the custodian that SPENDS the approval count and
+        # the presence nonce. Two components both spending would halve every
+        # cap and make the two ledgers disagree about what happened.
+        self._custodian = custodian_client
+        self.registry_versions = registry_versions or {}
         self._index_key = index_key
         # username -> {"public_key": hex, "revoked": bool}. Held by the
         # service, never supplied by the caller.
@@ -293,8 +302,43 @@ class DisclosureService:
     # -- scope tokens ----------------------------------------------------
 
     def blind_index(self, plate):
+        if self._custodian is not None and self._index_key is None:
+            return self._custodian.blind_index(plate)
         normalized = str(plate).strip().upper().encode("utf-8")
         return hmac.new(self._index_key, normalized, hashlib.sha256).hexdigest()
+
+    def _disclose_via_custodian(self, rows, statement, requester,
+                                proof_statement, proof):
+        """One record, one call. Deliberately not a batch.
+
+        Batching would let a caller hand over the whole table and have the
+        custodian sort out which ones it likes -- convenient, and exactly the
+        shape of the oracle stage 5 removes. Selecting candidates locally is
+        fine (it narrows what is sent); it is the custodian re-deriving scope
+        per record that makes the narrowing untrusted.
+        """
+        target_index = self.blind_index(statement["target_plate"])
+        window_start, window_end = statement["window_start"], statement["window_end"]
+
+        revealed = []
+        for row in rows:
+            if row.get("plate_index") != target_index:
+                continue
+            if not (window_start <= row.get("captured_at", "") <= window_end):
+                continue
+            identity = {"record_uid": row.get("record_uid"),
+                        "captured_at": row.get("captured_at"),
+                        "camera_id": row.get("camera_id"),
+                        "plate_index": row.get("plate_index")}
+            result = self._custodian.open(
+                row, identity, statement, self._local.signature, requester,
+                proof_statement, proof, registry_versions=self.registry_versions)
+            fields = result.get("fields") or {}
+            revealed.append({"id": row["id"], "plate": fields.get("plate"),
+                             "location": fields.get("location")})
+            self._local.use_count = result.get("use_count")
+            self._local.presence = {"custody": result.get("presence", "none")}
+        return revealed
 
     # -- approval verification -------------------------------------------
 
@@ -400,6 +444,7 @@ class DisclosureService:
                  proof_statement=None, proof=None):
         """Open the records an approval covers, and no others."""
         self._local.presence = None
+        self._local.signature = signature_hex
         self.verify_approval(statement, signature_hex)
         if statement["requester"] != requester:
             raise DisclosureError("this approval belongs to another requester")
@@ -408,6 +453,10 @@ class DisclosureService:
         # show the requester is here must not consume the approval's budget,
         # or refusing it would still cost the officer a disclosure.
         presence_result = self.verify_presence(statement, requester, proof_statement, proof)
+
+        if self._custodian is not None:
+            return self._disclose_via_custodian(
+                rows, statement, requester, proof_statement, proof)
 
         # Then spend both in one transaction. The approval's count stops a
         # compromised application replaying a genuine approval; the presence
@@ -647,7 +696,15 @@ def public_key_for(conn, db_path, create=False):
 
 
 def is_remote():
-    return bool(config.DISCLOSURE_URL)
+    """True when the index key lives in another process, whichever one.
+
+    A custodian counts. It holds the index key exactly as a disclosure
+    service does, so ingest must mint scope tokens there too -- otherwise
+    records are indexed under one key and searched under another, and the
+    store is silently unsearchable. That is precisely the failure the v1 -> v3
+    ceremony was built to catch, and it is available here just as easily.
+    """
+    return bool(config.DISCLOSURE_URL or config.CUSTODIAN_URL)
 
 
 def service_for(conn, db_path):
@@ -657,6 +714,28 @@ def service_for(conn, db_path):
 
     if config.DISCLOSURE_URL:
         return remote_client()
+
+    if config.CUSTODIAN_URL:
+        # The custodian holds the private key and the index key. This process
+        # holds neither: it seals against a public key it cannot invert, gets
+        # scope tokens from the custodian, and forwards candidates to be
+        # opened one at a time.
+        from . import custodian as _custodian
+
+        if not config.CUSTODIAN_CLIENT_SECRET:
+            raise DisclosureError(
+                "a custodian is configured but no client secret is set; "
+                "set JUSTIKEY_CUSTODIAN_CLIENT_SECRET")
+        client = _custodian.RemoteCustodian(
+            config.CUSTODIAN_URL, config.CUSTODIAN_CLIENT_ID,
+            config.CUSTODIAN_CLIENT_SECRET)
+        info = client.key_info()
+        return DisclosureService(
+            _PublicOnlyOpener(info["public_key"], info["kem"]), None,
+            local_approver_registry(conn), usage=UsageStore(db_path),
+            requester_registry=local_requester_registry(conn),
+            custodian_client=client,
+            registry_versions=info.get("registry_versions"))
 
     kem_name, private_hex = load_private_key_material(db_path)
     if private_hex is None:
@@ -668,6 +747,26 @@ def service_for(conn, db_path):
                              local_approver_registry(conn),
                              usage=UsageStore(db_path),
                              requester_registry=local_requester_registry(conn))
+
+
+def index_client():
+    """Whichever process holds the index key for this deployment.
+
+    A custodian takes precedence: when both are configured the custodian is
+    the deeper domain and is the one that re-derives scope at disclosure
+    time, so it must be the one that minted the index at ingest time.
+    """
+    if config.CUSTODIAN_URL:
+        from . import custodian as _custodian
+
+        if not config.CUSTODIAN_CLIENT_SECRET:
+            raise DisclosureError(
+                "a custodian is configured but no client secret is set; "
+                "set JUSTIKEY_CUSTODIAN_CLIENT_SECRET")
+        return _custodian.RemoteCustodian(
+            config.CUSTODIAN_URL, config.CUSTODIAN_CLIENT_ID,
+            config.CUSTODIAN_CLIENT_SECRET)
+    return remote_client()
 
 
 def remote_client():
@@ -713,6 +812,29 @@ def _registry(conn, role):
             entry["webauthn"] = dict(hardware)
         registry[row["username"]] = entry
     return registry
+
+
+class _PublicOnlyOpener:
+    """Stands where the opener used to, and cannot open anything.
+
+    With a custodian configured this process has no private key at all, so
+    what fills the opener's place must be incapable rather than merely
+    unused -- if a code path ever reaches it, that path is a bug and should
+    fail loudly instead of quietly working.
+    """
+
+    def __init__(self, public_hex, kem_name):
+        self.public_hex = public_hex
+        self.kem = kem_name
+        self.key_id = kem.key_id(kem_name, bytes.fromhex(public_hex))
+
+    def accepts(self, recipient_key_id):
+        return recipient_key_id == self.key_id
+
+    def open(self, *args, **kwargs):
+        raise DisclosureError(
+            "this process holds no disclosure private key; opening goes "
+            "through the custodian")
 
 
 def local_approver_registry(conn):

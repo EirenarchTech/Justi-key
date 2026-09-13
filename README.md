@@ -122,6 +122,7 @@ scripts/
   seal_store.py     the v1 -> v3 migration ceremony, step by step
   manage_keys.py    enrol hardware authenticators; export the service registries
   disclosure_server.py the disclosure service, as its own process and principal
+  custodian_server.py  the custodian: verifies the whole context, then agrees once
   verify_audit.py   independent verifier: chain + anchors + witness
 
 tests/
@@ -552,6 +553,80 @@ byte-exact assertions; what is missing is the front door to them. The web
 interface today collects the requester's password and signs with their
 software key. See [threat-model.md](docs/threat-model.md) finding 5 for
 exactly how far each custody gets you.
+
+## Key isolation: the custodian
+
+A non-exportable key in an HSM stops the key being stolen and does nothing
+about the second half of the problem. A compromised disclosure service holds
+every row's `ephemeral_pub` and credentials to call the KMS; one call per
+record decrypts the archive while the key never leaves the hardware. **Raw
+ECDH is the unrestricted oracle.**
+
+    KMS protects the key.  The custodian protects the operation.
+
+So `scripts/custodian_server.py` runs as its own process and principal, and
+offers two routes and no third:
+
+```
+POST /index   a scope token, so the custodian re-derives scope itself
+POST /open    ONE record, after verifying the whole disclosure context
+```
+
+There is no `/derive`, no `/agree`, no `/unwrap` — a test asserts those
+return 404. `/open` takes one record rather than a list, because batching
+would let a caller hand over the table and have the custodian sort out which
+ones it likes, which is the oracle's shape with extra steps.
+
+Before agreeing to anything it independently re-checks registry versions,
+envelope well-formedness, suite, recipient key, the approver's signature,
+scope re-derived from **its own** index key, the requester's proof of
+presence, freshness, single use, and remaining capacity — then spends the
+approval count and the presence nonce in one transaction.
+
+```bash
+python3 scripts/custodian_server.py --port 8091 \
+    --client-secret "$CUSTODIAN_SECRET" --index-key "$INDEX_KEY" \
+    --approvers approvers.json --requesters requesters.json \
+    --ledger custodian-audit.db \
+    --kms-key-arn arn:aws:kms:...:key/... --attestation-file /run/attestation.bin
+```
+
+The application then holds **no private key and no index key**:
+
+```bash
+JUSTIKEY_CUSTODIAN_URL=http://custodian-host:8091 \
+JUSTIKEY_CUSTODIAN_CLIENT_SECRET=<secret> \
+JUSTIKEY_DISCLOSURE_PUBLIC_KEY=<public key> python3 scripts/run_server.py
+```
+
+`service_for` installs an opener that *cannot open* — it raises rather than
+working — so a code path that ever reaches it fails loudly. And the custodian
+owns the spending: the disclosure service still runs every check it ran
+before, because a second opinion is the point, but two components both
+spending would halve every cap and leave the ledgers disagreeing.
+
+Measured through the real transport, ten sealed records, one genuine approval
+naming one of them, replayed against every row:
+
+```
+opened: ['SECRET99']
+custodian ledger: 1 open_granted, 9 open_refused, chain verifies
+plate anywhere in that ledger: no
+```
+
+**On Nitro** the custodian runs inside the enclave and the parent proxies over
+vsock; `--attestation-file` goes to KMS as `Recipient`, so the secret is
+encrypted to the enclave and the parent never sees it, and the key policy can
+require the enclave measurement. `GET /publickey` reports `"attested"`, and an
+unattested custodian prints a startup notice saying plainly that the
+configuration does not meet the objective — a development setup should not be
+able to pass for a production one.
+
+**Not built:** enclave-side decryption of `CiphertextForRecipient` needs the
+NSM device, so outside an enclave it is a named refusal rather than a stub; a
+vsock transport to replace TCP; and the AWS behaviour is exercised against a
+stand-in implementing the documented policy semantics, not against AWS. See
+[stage-5-key-isolation.md](docs/stage-5-key-isolation.md).
 
 ## Limits enforced in software, not policy
 

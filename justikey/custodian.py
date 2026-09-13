@@ -69,6 +69,97 @@ class AgreementUnavailable(CustodianError):
 
 
 # ---------------------------------------------------------------------------
+# Client: the disclosure service's view of a custodian in another process
+# ---------------------------------------------------------------------------
+
+class RemoteCustodian:
+    """Calls a custodian running as its own process and principal.
+
+    Exposes `open` and `blind_index` and nothing else, because those are the
+    only two things the custodian offers. Notably absent is any way to ask for
+    key material: there is nothing to add here that the remote end does not
+    already refuse, and a convenience method that looked like one would
+    misrepresent the boundary.
+
+    Nothing this client sends is trusted by the far end. It re-verifies the
+    approval, re-derives scope from its own index key, and spends the nonces
+    itself -- so a compromised disclosure service gains nothing by lying here.
+    """
+
+    def __init__(self, url, client_id, client_secret, timeout=None):
+        from . import config
+
+        self.url = url.rstrip("/")
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.timeout = timeout or config.DISCLOSURE_TIMEOUT_SECONDS
+        self._key_info = None
+
+    def _post(self, path, payload):
+        import json as _json
+        import secrets
+        from urllib import error, request
+
+        from . import servicekit
+
+        body = _json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        timestamp, nonce = timeutil.now_iso(), secrets.token_urlsafe(16)
+        req = request.Request(self.url + path, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("X-JustiKey-Client-Id", self.client_id)
+        req.add_header("X-JustiKey-Timestamp", timestamp)
+        req.add_header("X-JustiKey-Nonce", nonce)
+        req.add_header("X-JustiKey-Signature",
+                       servicekit.request_signature(self.client_secret, timestamp,
+                                                    nonce, body))
+        try:
+            with request.urlopen(req, timeout=self.timeout) as response:
+                return _json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+            if exc.code == 503:
+                raise AgreementUnavailable(
+                    f"the custodian could not reach its key holder: {detail}") from exc
+            raise CustodianError(f"the custodian refused ({exc.code}): {detail}") from exc
+        except (error.URLError, OSError, ValueError) as exc:
+            # Unreachable is a clean refusal, never "open it anyway".
+            raise AgreementUnavailable(f"custodian unreachable: {exc!r}") from exc
+
+    def key_info(self):
+        if self._key_info is None:
+            import json as _json
+            from urllib import error, request
+
+            try:
+                with request.urlopen(self.url + "/publickey", timeout=self.timeout) as r:
+                    self._key_info = _json.loads(r.read().decode("utf-8"))
+            except (error.URLError, OSError, ValueError) as exc:
+                raise AgreementUnavailable(
+                    f"could not reach the custodian at {self.url}: {exc!r}") from exc
+        return self._key_info
+
+    def blind_index(self, plate):
+        return self._post("/index", {"plate": plate})["plate_index"]
+
+    def open(self, envelope, identity, statement, signature, requester,
+             proof_statement=None, proof=None, registry_versions=None):
+        return self._post("/open", {
+            "envelope": {k: envelope.get(k) for k in ENVELOPE_FIELDS},
+            "identity": identity,
+            "statement": statement,
+            "signature": signature,
+            "requester": requester,
+            "presence": proof_statement,
+            "presence_proof": proof,
+            "registry_versions": registry_versions,
+        })
+
+
+ENVELOPE_FIELDS = ("record_uid", "seal_version", "seal_kem", "recipient_key_id",
+                   "record_ct", "wrapped_key", "ephemeral_pub")
+
+
+# ---------------------------------------------------------------------------
 # Backends
 # ---------------------------------------------------------------------------
 

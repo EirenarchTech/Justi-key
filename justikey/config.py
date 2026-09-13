@@ -77,6 +77,16 @@ INDEX_KEY_HEX = os.environ.get("JUSTIKEY_INDEX_KEY") or None
 # See docs/stage-5-key-isolation.md.
 DISCLOSURE_KEM = os.environ.get("JUSTIKEY_DISCLOSURE_KEM") or None
 
+# --- Custodian (stage 5) ----------------------------------------------------
+# When set, the disclosure service does not open records itself: it forwards
+# each one to a custodian in its own process and principal, which re-verifies
+# the whole disclosure context before agreeing to anything. The custodian then
+# owns the approval count and presence nonces, so they are spent once, by the
+# component furthest from the attacker -- see docs/stage-5-key-isolation.md.
+CUSTODIAN_URL = os.environ.get("JUSTIKEY_CUSTODIAN_URL") or None
+CUSTODIAN_CLIENT_ID = os.environ.get("JUSTIKEY_CUSTODIAN_CLIENT_ID", "disclosure-service")
+CUSTODIAN_CLIENT_SECRET = os.environ.get("JUSTIKEY_CUSTODIAN_CLIENT_SECRET") or None
+
 # --- Scope and retention limits --------------------------------------------
 # Widest time window an authorization may request. The approver is expected
 # to judge proportionality, but "not unnecessarily broad" should be enforced
