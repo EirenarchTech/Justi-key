@@ -8,8 +8,8 @@ is denied and the reason is returned so the caller can audit it.
 """
 import threading
 
-from . import (approvals, config, custody, disclosure, models, presence,
-               sealing, timeutil)
+from . import (approvals, config, custodian, custody, disclosure, models,
+               presence, sealing, timeutil)
 
 # What the most recent disclosure on this thread proved about the requester.
 # Kept per-thread because the server handles requests concurrently and an
@@ -122,10 +122,6 @@ def evaluate_disclosure(conn, auth_id, requested_plate, actor_user,
     if limit > 0 and auth_row["disclosure_count"] >= limit:
         return False, "disclosure_limit_reached", []
 
-    candidates = models.search_events(
-        conn, auth_row["target_plate"], auth_row["window_start"], auth_row["window_end"]
-    )
-
     try:
         service = disclosure.service_for(conn, conn.db_path or "")
     except disclosure.DisclosureError:
@@ -134,17 +130,39 @@ def evaluate_disclosure(conn, auth_id, requested_plate, actor_user,
         # unreachable. Deny cleanly and audibly rather than erroring out, and
         # never fall back to a path that would open records without it.
         return False, "disclosure_unavailable", []
-    if service is None:
-        return True, None, candidates      # v1: already revealed
 
-    # v2: this process cannot open a sealed record. The disclosure service
-    # holds the key, and it re-derives scope from the approver's signed
-    # statement rather than trusting the selection made above.
+    if service is None:
+        # v1: values are already revealed and the index is local.
+        return True, None, models.search_events(
+            conn, auth_row["target_plate"], auth_row["window_start"],
+            auth_row["window_end"])
+
+    # v2 and later: this process cannot open a sealed record. The statement is
+    # built BEFORE the search, because with a custodian the scope token comes
+    # from the approval rather than from a plate this process names -- an
+    # arbitrary-plate token is an enumeration oracle, so the approval is what
+    # entitles a search at all.
     approver = models.get_user_by_id(conn, auth_row["approved_by"])
     statement = approvals.build_statement(
         auth_row, actor_user["username"], approver["username"],
         auth_row["approved_at"], auth_row["approval_expires_at"],
         approver_key_id=approvals.signing_key_id(approver["signing_pub"]))
+
+    try:
+        token = service.search_token(statement, auth_row["approval_signature"])
+    except disclosure.DisclosureError:
+        return False, "disclosure_unavailable", []
+    except custodian.AgreementUnavailable:
+        return False, "disclosure_unavailable", []
+    except custodian.CustodianError:
+        # Deliberately narrow. A broad `except Exception` here turned a missing
+        # method into a clean-looking denial, which is exactly how a bug hides
+        # behind a refusal that reads as correct behaviour.
+        return False, "disclosure_refused", []
+
+    candidates = models.search_events(
+        conn, auth_row["target_plate"], auth_row["window_start"],
+        auth_row["window_end"], plate_index=token)
     # Proof of presence. An approval is a bearer capability until the person
     # it belongs to shows up for this specific request, so the proof is built
     # over the statement that was actually signed and nothing else.

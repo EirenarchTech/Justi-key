@@ -80,16 +80,38 @@ STATE = {}
 
 ALLOWED_FIELDS = {
     "index": {"plate"},
+    "search-token": {"statement", "signature", "registry_versions"},
     "open": {"envelope", "identity", "statement", "signature", "requester",
              "presence", "presence_proof", "registry_versions"},
     "publickey": set(),
 }
 
+# Which caller may ask for what. `index` mints a scope token for an ARBITRARY
+# plate, which is the whole capability the blind-index key confers: a caller
+# holding the archive and this operation can ask for a token per candidate
+# plate and map every sealed row without opening one. Measured before the
+# split: 25 of 25 records identified in 0.44s against a small candidate space.
+#
+# So it is reserved to an ingest credential that the disclosure host does not
+# have, and an attested custodian refuses to offer it at all. The disclosure
+# host gets `search-token` instead, which mints a token for exactly the plate
+# an approver signed for and nothing else.
+OPERATION_ROLES = {
+    "index": {"ingest"},
+    "search-token": {"disclosure"},
+    "open": {"disclosure"},
+    "publickey": {"ingest", "disclosure"},
+}
 
-def dispatch(operation, payload):
+
+def dispatch(operation, payload, role="disclosure"):
     """(reply, status). Unknown operations are refused by name."""
     if operation not in ALLOWED_FIELDS:
         return {"error": f"unknown operation {operation!r}"}, 404
+    if role not in OPERATION_ROLES[operation]:
+        return {"error": f"{operation!r} is not available to a {role!r} caller"}, 403
+    if operation == "index" and not STATE.get("allow_ingest_tokens"):
+        return {"error": "this custodian does not mint arbitrary scope tokens"}, 403
     unknown = set(payload or {}) - ALLOWED_FIELDS[operation]
     if unknown:
         # Refused rather than ignored: a field this version ignores is a field
@@ -114,13 +136,55 @@ def op_publickey(_payload):
     }, 200
 
 
-def op_index(payload):
-    """A scope token, for the disclosure service's own candidate search.
+def op_search_token(payload):
+    """A scope token for exactly the plate an approver signed for.
 
-    The custodian holds an index key so it can re-derive scope for itself at
-    disclosure time. Exposing it here means the disclosure service need not
-    hold a second copy -- but it is the same grinding channel described in
-    threat-model finding 1, so it is rate limited and every call is recorded.
+    This is what the disclosure host gets instead of `index`. The approval is
+    verified here, in full, before a token exists -- so a compromised parent
+    can obtain tokens only for plates an approver independently authorised,
+    rather than for every plate it can think of.
+
+    It spends nothing. `open` remains the single transactional point, so a
+    search that finds no candidates costs the requester nothing.
+    """
+    statement = payload.get("statement")
+    if not isinstance(statement, dict):
+        return {"error": "malformed approval statement"}, 403
+    instance = STATE["custodian"]
+    try:
+        instance._check_registries(payload.get("registry_versions"))
+        # Requester is taken from the statement rather than from the caller:
+        # this operation authorises a scope, not a person, and the person is
+        # checked at open.
+        instance._check_approval(statement, payload.get("signature"),
+                                 statement.get("requester"))
+    except custodian.CustodianError as exc:
+        STATE["record"]("search_token_refused", "client", {"reason": str(exc)[:300]})
+        return {"error": str(exc)}, 403
+    if not search_token_rate_ok():
+        STATE["record"]("search_token_rate_limited", "client",
+                        {"limit_per_minute": STATE["index_limit"]})
+        return {"error": "scope-token rate limit exceeded"}, 429
+
+    STATE["record"]("search_token_issued", "client", {
+        "authorization_id": statement.get("authorization_id"),
+        "approver": statement.get("approver"),
+        "case": statement.get("case_number")})
+    return {"plate_index": blind_index(statement["target_plate"])}, 200
+
+
+def op_index(payload):
+    """A scope token for an ARBITRARY plate. Ingest only, and not in production.
+
+    This operation is the blind-index key's capability, exposed. A caller with
+    the sealed archive and this operation maps every row without opening one.
+    It exists because ingest must index observations as they arrive, and it is
+    gated by a credential the disclosure host does not hold -- so mapping the
+    archive needs both the ingest capability (which has no archive) and the
+    archive (which has no capability).
+
+    An attested custodian refuses to offer it. The real fix is tokenisation at
+    the sensor; see threat-model.md.
     """
     plate = payload.get("plate")
     if not isinstance(plate, str) or not plate.strip():
@@ -179,7 +243,8 @@ def op_open(payload):
             "presence": result["presence"], "context": result["context_digest"]}, 200
 
 
-_OPERATIONS = {"index": op_index, "open": op_open, "publickey": op_publickey}
+_OPERATIONS = {"index": op_index, "search-token": op_search_token,
+               "open": op_open, "publickey": op_publickey}
 
 
 class Handler(servicekit.AuthenticatedHandler, BaseHTTPRequestHandler):
@@ -204,7 +269,7 @@ class Handler(servicekit.AuthenticatedHandler, BaseHTTPRequestHandler):
         payload = self._payload()
         if payload is None:
             return
-        reply, status = dispatch(operation, payload)
+        reply, status = dispatch(operation, payload, role=self.client_role)
         self._json(status, reply)
 
 
@@ -221,7 +286,15 @@ def blind_index(plate):
     return hmac.new(STATE["index_key"], normalized, hashlib.sha256).hexdigest()
 
 
+def search_token_rate_ok():
+    return _rate_ok("search_calls")
+
+
 def index_rate_ok():
+    return _rate_ok("index_calls")
+
+
+def _rate_ok(bucket):
     import time
 
     limit, window = STATE["index_limit"], 60.0
@@ -229,7 +302,7 @@ def index_rate_ok():
         return True
     now = time.monotonic()
     with STATE["index_lock"]:
-        calls = STATE["index_calls"]
+        calls = STATE.setdefault(bucket, [])
         while calls and now - calls[0] > window:
             calls.pop(0)
         if len(calls) >= limit:
@@ -295,6 +368,12 @@ def main():
     parser.add_argument("--client-secret",
                         default=os.environ.get("JUSTIKEY_CUSTODIAN_CLIENT_SECRET"),
                         help="shared secret the disclosure service authenticates with")
+    parser.add_argument("--ingest-secret",
+                        default=os.environ.get("JUSTIKEY_CUSTODIAN_INGEST_SECRET"),
+                        help="separate secret for the ingest path, which may mint "
+                             "scope tokens for arbitrary plates. Must NOT be present "
+                             "on the disclosure host, and an attested custodian "
+                             "refuses it outright")
     parser.add_argument("--index-key", default=os.environ.get("JUSTIKEY_INDEX_KEY"),
                         help="blind-index key, so scope is re-derived here")
     parser.add_argument("--approvers", help="JSON file of enrolled approver keys")
@@ -355,7 +434,9 @@ def main():
     STATE.update({
         "record": record,
         "usage": usage,
-        "client_secret": args.client_secret,
+        "client_secrets": {"disclosure": args.client_secret,
+                           "ingest": args.ingest_secret},
+        "allow_ingest_tokens": bool(args.ingest_secret),
         "index_key": bytes.fromhex(args.index_key),
         "index_limit": args.index_limit,
         "index_lock": __import__("threading").Lock(),
@@ -377,6 +458,18 @@ def main():
     # TCP listener in that configuration either means this is not really an
     # enclave, or means something has been arranged to reach it that should
     # not exist. Refusing is cheaper than discovering which.
+    # An attested custodian must not be an enumeration oracle. `index` mints a
+    # token for any plate asked of it, which is the blind-index key's entire
+    # capability; offering it from the component that also holds the archive's
+    # only key would undo the isolation the enclave exists to provide.
+    if attested and args.ingest_secret:
+        print("\nRefusing to start: an attested custodian must not offer ingest "
+              "scope tokens.\n`index` mints a token for any plate, which is the "
+              "blind-index key's whole\ncapability -- a caller with the archive and "
+              "that operation maps every row\nwithout opening one. Run ingest against "
+              "its own custodian, on a host that\nholds no archive.", file=sys.stderr)
+        sys.exit(5)
+
     if attested and args.transport != "vsock":
         print("\nRefusing to start: an attested custodian must serve on vsock, not "
               "TCP.\nAn enclave's only channel is AF_VSOCK; a TCP listener here means "
@@ -396,6 +489,8 @@ def main():
           f"{' (attested)' if attested else ''}")
     print(f"  key id     : {agreement.key_id}  [{agreement.kem}]")
     print(f"  presence   : {args.presence_mode}")
+    print(f"  scope tokens: search-token (approved scope only)"
+          f"{'; index ENABLED for ingest' if args.ingest_secret else ''}")
     print(f"  registries : approver v{versions['approver']}, "
           f"requester v{versions['requester']}")
     print(f"  ledger     : {args.ledger}")

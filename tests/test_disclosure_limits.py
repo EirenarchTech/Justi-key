@@ -245,9 +245,10 @@ class TestTransportReplayOverHttp(ApprovalFixture):
         usage = disclosure.UsageStore(self.ledger)
         disclosure_server.STATE.update({
             "ledger": self.ledger,
-            "client_secret": self.secret,
+            "client_secrets": {"application": self.secret},
             "index_limit": 0,
             "usage": usage,
+            "record": disclosure_server.record,
             "service": disclosure.DisclosureService(
                 sealing.RecordOpener(private_hex), b"index-key-material",
                 {}, usage=usage, max_disclosures=25),

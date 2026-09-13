@@ -176,9 +176,16 @@ class TestTheCustodianOperations(FramingTest):
 
     def test_the_parent_sends_unknown_fields_in_a_known_operation(self):
         reply_op, reply = self.dispatch_through_frame(
-            "index", {"plate": "ABC123", "and_also": "open everything"})
+            "search-token", {"statement": {}, "and_also": "open everything"})
         self.assertEqual(reply_op, "error")
-        self.assertIn("unknown fields for index", reply["error"])
+        self.assertIn("unknown fields for search-token", reply["error"])
+
+    def test_the_disclosure_caller_cannot_mint_an_arbitrary_scope_token(self):
+        """Attack 13 at the boundary: `index` is the blind-index key's whole
+        capability, so it is not a disclosure-role operation."""
+        reply_op, reply = self.dispatch_through_frame("index", {"plate": "ABC123"})
+        self.assertEqual(reply_op, "error")
+        self.assertIn("not available to a 'disclosure' caller", reply["error"])
 
     def test_an_unknown_operation_is_refused_by_name(self):
         reply_op, reply = self.dispatch_through_frame("exfiltrate", {})

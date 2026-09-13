@@ -623,6 +623,28 @@ unattested custodian prints a startup notice saying plainly that the
 configuration does not meet the objective — a development setup should not be
 able to pass for a production one.
 
+### The scope-token oracle, and why `/index` had to change
+
+Moving the blind-index key into the enclave is not the same as moving its
+capability. While the custodian would answer `index(plate)` for any plate, a
+compromised parent holding the archive could ask for a token per candidate
+and map every sealed row without opening one — **measured at 25 of 25
+records, 100% correct, in 0.44 seconds**.
+
+So the capability is split, not just the key:
+
+| Operation | Answers for | Caller |
+|---|---|---|
+| `index` | any plate | ingest credential only; an attested custodian refuses to offer it |
+| `search-token` | exactly the plate an approver signed for | disclosure credential |
+
+`search-token` verifies the approval before a token exists and spends
+nothing, so `open` remains the single transactional point. After the split
+the same attack grants 0 tokens in 270 attempts. Mapping the archive now
+needs both the ingest capability (on a host holding no archive) and the
+archive (which has no such capability). See
+[threat-model.md](docs/threat-model.md) finding 7.
+
 ### Transport: vsock in production
 
 ```

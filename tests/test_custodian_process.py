@@ -49,6 +49,7 @@ class CustodianProcessTest(unittest.TestCase):
         self.path = os.path.join(self.dir, "justikey.db")
         self.ledger = os.path.join(self.dir, "custodian-audit.db")
         self.secret = "custodian-client-secret"
+        self.ingest_secret = "custodian-ingest-secret"
         self.index_key = bytes.fromhex("11" * 32)
 
         self.image = image_sha384("approved-enclave")
@@ -128,7 +129,13 @@ class CustodianProcessTest(unittest.TestCase):
         self._saved_state = dict(self.module.STATE)
         self.module.STATE.clear()
         self.module.STATE.update({
-            "record": record, "usage": usage, "client_secret": self.secret,
+            "record": record, "usage": usage,
+            # Two credentials, two capabilities: the disclosure host may ask
+            # for a token only within an approved scope; the ingest secret,
+            # which mints a token for any plate, is a separate role.
+            "client_secrets": {"disclosure": self.secret,
+                               "ingest": self.ingest_secret},
+            "allow_ingest_tokens": True,
             "index_key": self.index_key, "index_limit": 0,
             "index_lock": threading.Lock(), "index_calls": [],
             "registry_versions": versions,
@@ -265,8 +272,11 @@ class TestTheBoundaryRefuses(CustodianProcessTest):
 
     def test_a_replayed_request_is_refused(self):
         nonce = "a-fixed-transport-nonce"
-        self.assertEqual(self.post("/index", {"plate": PLATE}, nonce=nonce)[0], 200)
-        status, payload = self.post("/index", {"plate": PLATE}, nonce=nonce)
+        self.assertEqual(
+            self.post("/index", {"plate": PLATE}, secret=self.ingest_secret,
+                      nonce=nonce)[0], 200)
+        status, payload = self.post("/index", {"plate": PLATE},
+                                    secret=self.ingest_secret, nonce=nonce)
         self.assertEqual(status, 401)
         self.assertIn("already been used", payload["error"])
 
@@ -448,12 +458,27 @@ class TestTheApplicationHoldsNoIndexKey(CustodianProcessTest):
     def test_ingest_mints_its_index_at_the_custodian(self):
         """Indexed under one key and searched under another is a store that
         looks perfect and finds nothing."""
+        saved = config.CUSTODIAN_INGEST_SECRET
+        config.CUSTODIAN_INGEST_SECRET = self.ingest_secret
+        self.addCleanup(setattr, config, "CUSTODIAN_INGEST_SECRET", saved)
         conn = db.get_connection(self.path)
         self.addCleanup(conn.close)
         token = models.scope_token(conn, PLATE)
         self.assertEqual(token, _StaticIndex(self.index_key).blind_index(PLATE))
 
+    def test_the_disclosure_host_cannot_mint_a_token_for_an_arbitrary_plate(self):
+        """Attack 13. The capability, not just the key, has to move."""
+        saved = config.CUSTODIAN_INGEST_SECRET
+        config.CUSTODIAN_INGEST_SECRET = None
+        self.addCleanup(setattr, config, "CUSTODIAN_INGEST_SECRET", saved)
+        with self.assertRaises(disclosure.DisclosureError) as caught:
+            disclosure.index_client()
+        self.assertIn("ingest capability", str(caught.exception))
+
     def test_the_index_client_prefers_the_custodian(self):
+        saved = config.CUSTODIAN_INGEST_SECRET
+        config.CUSTODIAN_INGEST_SECRET = self.ingest_secret
+        self.addCleanup(setattr, config, "CUSTODIAN_INGEST_SECRET", saved)
         client = disclosure.index_client()
         self.assertIsInstance(client, custodian.RemoteCustodian)
 

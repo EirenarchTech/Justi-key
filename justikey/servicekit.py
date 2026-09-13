@@ -171,8 +171,13 @@ class AuthenticatedHandler:
     """Mixin: read and authenticate a request body, or respond and return None.
 
     Expects the concrete handler to expose `state`, a mapping carrying
-    `client_secret`, `usage` and `record`.
+    `client_secrets` (role -> secret), `usage` and `record`. The matching
+    role is left on `self.client_role`, because which credential signed
+    decides what the caller may ask for -- transport authentication says who
+    is calling, never what they are allowed to have.
     """
+
+    client_role = None
 
     server_version = "JustiKey/1.0"
     protocol_version = "HTTP/1.1"
@@ -217,8 +222,15 @@ class AuthenticatedHandler:
         if skew > CLOCK_SKEW_SECONDS:
             self._json(401, {"error": "timestamp outside the accepted window"})
             return None
-        expected = request_signature(state["client_secret"], timestamp, nonce, body)
-        if not hmac.compare_digest(expected, signature):
+        # Which credential signed decides what the caller may ask for. Every
+        # candidate is compared, so a wrong secret cannot be distinguished
+        # from an unknown role by how long the refusal takes.
+        self.client_role = None
+        for role, secret in state["client_secrets"].items():
+            if secret and hmac.compare_digest(
+                    request_signature(secret, timestamp, nonce, body), signature):
+                self.client_role = role
+        if self.client_role is None:
             state["record"]("client_auth_failed", f"client:{client[:64]}",
                             {"reason": "bad signature"})
             self._json(401, {"error": "invalid client signature"})

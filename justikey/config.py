@@ -87,6 +87,13 @@ CUSTODIAN_URL = os.environ.get("JUSTIKEY_CUSTODIAN_URL") or None
 CUSTODIAN_CLIENT_ID = os.environ.get("JUSTIKEY_CUSTODIAN_CLIENT_ID", "disclosure-service")
 CUSTODIAN_CLIENT_SECRET = os.environ.get("JUSTIKEY_CUSTODIAN_CLIENT_SECRET") or None
 
+# The ingest capability: minting a scope token for an ARBITRARY plate. That is
+# the blind-index key's whole capability, so a host holding this secret AND the
+# sealed archive can map every row without opening one -- measured at 25 of 25
+# records in 0.44s. Set it on the ingest host, which holds no archive, and
+# never on the disclosure host.
+CUSTODIAN_INGEST_SECRET = os.environ.get("JUSTIKEY_CUSTODIAN_INGEST_SECRET") or None
+
 # --- Scope and retention limits --------------------------------------------
 # Widest time window an authorization may request. The approver is expected
 # to judge proportionality, but "not unnecessarily broad" should be enforced

@@ -249,7 +249,7 @@ def _reveal_event(cipher, row):
     return event
 
 
-def search_events(conn, plate, start, end):
+def search_events(conn, plate, start, end, plate_index=None):
     """Exact-plate lookup inside a time window.
 
     The match runs against the keyed blind index, so the query never handles
@@ -264,9 +264,13 @@ def search_events(conn, plate, start, end):
             "ORDER BY captured_at ASC", (plate, start, end)).fetchall()
         return [dict(r) for r in rows]
 
+    # A caller that already holds an approved scope token passes it: with a
+    # custodian, tokens for arbitrary plates are an enumeration oracle and are
+    # not available here, so the token must come from the approval.
+    token = plate_index if plate_index is not None else scope_token(conn, plate)
     rows = conn.execute(
         "SELECT * FROM lpr_events WHERE plate_index=? AND captured_at>=? AND captured_at<=? "
-        "ORDER BY captured_at ASC", (scope_token(conn, plate), start, end)).fetchall()
+        "ORDER BY captured_at ASC", (token, start, end)).fetchall()
     if crypto_store.encryption_mode(conn) == crypto_store.MODE_V3:
         return [dict(r) for r in rows]          # still sealed, deliberately
     return [_reveal_event(cipher, r) for r in rows]

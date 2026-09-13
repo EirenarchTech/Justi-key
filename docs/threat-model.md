@@ -228,7 +228,54 @@ records fails the tag check. The record uid is generated at seal time rather
 than taken from the row id, which the database — and therefore an attacker
 with SQL — controls.
 
-## 7. Registry integrity
+## 7. The scope-token oracle — attack 13
+
+Stage 5 moved the blind-index key into the enclave. It did not, at first,
+move the key's *capability*.
+
+The custodian exposed `/index`: give it a plate, get its blind index. A
+compromised parent holding the sealed archive then runs
+
+```
+for every plausible plate:
+    token = custodian /index(plate)
+    compare token with the stored blind indexes
+```
+
+and learns which sealed row is which vehicle, without opening one. Plates are
+low-entropy, so this is materially different from attacking a random secret.
+
+**Measured before the fix: 25 of 25 records identified, 100% correct, in 0.44
+seconds** against a 270-plate candidate space. The 600/min rate limit sets a
+pace, not a bound: about 20 days for the whole AAA999 space, and minutes for
+a targeted subset — a regional format, or a watchlist.
+
+### The fix: split the capability, not just the key
+
+| Operation | Answers for | Who may call it |
+|---|---|---|
+| `index` | any plate | the ingest credential only, and an attested custodian refuses to offer it at all |
+| `search-token` | exactly the plate an approver signed for, after the custodian verifies the approval | the disclosure credential |
+
+`search-token` spends nothing: `open` stays the single transactional point,
+so a search that finds no candidates costs the requester none of their
+approval.
+
+After the fix, the same attack grants **0 tokens in 270 attempts and maps 0
+of 25 records** — by either operation. A forged approval yields no token
+either: the signature is checked before a token exists.
+
+**What remains, stated precisely.** With a genuine approval, the disclosure
+host learns which rows match the one plate that approval names. That is the
+same scope the approval already authorises opening, so it reveals nothing the
+lawful path would not. And mapping the archive now requires *both* the ingest
+capability — which lives on a host holding no archive — and the archive,
+which has no such capability. An attacker needs both, on two hosts, at once.
+
+The full fix is still tokenisation at the sensor, so no component downstream
+ever holds a plate-to-token function. See the closing section.
+
+## 8. Registry integrity
 
 The disclosure service decides whose approvals and whose proofs of presence it
 accepts by reading two files on its own host. The application cannot write
@@ -255,7 +302,7 @@ routine use never rewrites the file whose digest is committed — otherwise
 every disclosure would look like a configuration change, and a real one would
 not stand out.
 
-## 8. Audit integrity
+## 9. Audit integrity
 
 The application and the disclosure service each keep their own hash-chained
 ledger. Appends are serialized (`BEGIN IMMEDIATE`, plus an in-process lock in
@@ -269,7 +316,7 @@ The disclosure ledger deliberately does **not** record the plate involved in
 a scope-token request. Logging it would rebuild the archive the service
 exists to protect.
 
-## 9. Availability as a safety property
+## 10. Availability as a safety property
 
 If the disclosure service is unreachable, lawful access stops. That is
 correct, and it is deliberate: there is no fallback path that opens records

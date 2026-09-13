@@ -140,7 +140,26 @@ class RemoteCustodian:
         return self._key_info
 
     def blind_index(self, plate):
+        """A token for an arbitrary plate. Ingest path only.
+
+        Reserved to a credential the disclosure host does not hold: a caller
+        with the sealed archive and this operation maps every row without
+        opening one. See `search_token` for what the disclosure host uses.
+        """
         return self._call("index", {"plate": plate})["plate_index"]
+
+    def search_token(self, statement, signature, registry_versions=None):
+        """A token for exactly the plate an approver signed for.
+
+        The custodian verifies the approval before a token exists, so this
+        cannot be turned into an enumeration oracle: the only scopes it will
+        answer for are ones an approver independently authorised. It spends
+        nothing -- `open` remains the single transactional point, so a search
+        that finds nothing costs the requester nothing.
+        """
+        return self._call("search-token", {
+            "statement": statement, "signature": signature,
+            "registry_versions": registry_versions})["plate_index"]
 
     def open(self, envelope, identity, statement, signature, requester,
              proof_statement=None, proof=None, registry_versions=None):

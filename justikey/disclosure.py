@@ -302,10 +302,27 @@ class DisclosureService:
     # -- scope tokens ----------------------------------------------------
 
     def blind_index(self, plate):
-        if self._custodian is not None and self._index_key is None:
-            return self._custodian.blind_index(plate)
+        if self._index_key is None:
+            raise DisclosureError(
+                "this service holds no index key; an approved search goes "
+                "through search_token, and arbitrary-plate tokens belong to "
+                "the ingest path")
         normalized = str(plate).strip().upper().encode("utf-8")
         return hmac.new(self._index_key, normalized, hashlib.sha256).hexdigest()
+
+    def search_token(self, statement, signature):
+        """The scope token for an approved search.
+
+        With a custodian, this is NOT a blind index of an arbitrary plate --
+        that operation is reserved to the ingest path, because a caller
+        holding the archive and an arbitrary-plate oracle can map every row
+        without opening one. The custodian verifies the approval and answers
+        for that scope only.
+        """
+        if self._custodian is not None:
+            return self._custodian.search_token(statement, signature,
+                                                self.registry_versions)
+        return self.blind_index(statement["target_plate"])
 
     def _disclose_via_custodian(self, rows, statement, requester,
                                 proof_statement, proof):
@@ -317,7 +334,7 @@ class DisclosureService:
         fine (it narrows what is sent); it is the custodian re-deriving scope
         per record that makes the narrowing untrusted.
         """
-        target_index = self.blind_index(statement["target_plate"])
+        target_index = self.search_token(statement, self._local.signature)
         window_start, window_end = statement["window_start"], statement["window_end"]
 
         revealed = []
@@ -526,6 +543,17 @@ class RemoteDisclosureService:
         except (error.URLError, OSError, json.JSONDecodeError) as exc:
             # Unreachable is a clean denial, never "open it anyway".
             raise DisclosureError(f"disclosure service unreachable: {exc!r}") from exc
+
+    def search_token(self, statement, signature):
+        """A scope token for an approved search.
+
+        A stage 3 disclosure service has no separate approved-scope operation,
+        so this is the plate's blind index. The enumeration concern that
+        motivates `search-token` on a custodian applies here too, and is
+        threat-model finding 1's residual: this endpoint answers for any plate
+        the application names.
+        """
+        return self.blind_index(statement["target_plate"])
 
     def blind_index(self, plate):
         """Ask the service for a scope token.
@@ -759,13 +787,19 @@ def index_client():
     if config.CUSTODIAN_URL:
         from . import custodian as _custodian
 
-        if not config.CUSTODIAN_CLIENT_SECRET:
+        # Ingest mints tokens for arbitrary plates, which is a capability the
+        # disclosure host must not have. It therefore authenticates with its
+        # own secret; a host without that secret cannot index at all.
+        if not config.CUSTODIAN_INGEST_SECRET:
             raise DisclosureError(
-                "a custodian is configured but no client secret is set; "
-                "set JUSTIKEY_CUSTODIAN_CLIENT_SECRET")
+                "minting a scope token for an arbitrary plate is the ingest "
+                "capability, and this host holds no ingest secret. Set "
+                "JUSTIKEY_CUSTODIAN_INGEST_SECRET on the ingest host only -- a "
+                "host with both this capability and the sealed archive can map "
+                "every record without opening one.")
         return _custodian.RemoteCustodian(
-            url=config.CUSTODIAN_URL, client_id=config.CUSTODIAN_CLIENT_ID,
-            client_secret=config.CUSTODIAN_CLIENT_SECRET)
+            url=config.CUSTODIAN_URL, client_id="ingest",
+            client_secret=config.CUSTODIAN_INGEST_SECRET)
     return remote_client()
 
 

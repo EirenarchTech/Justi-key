@@ -237,7 +237,7 @@ class TestTheWholeCeremonyRemote(CeremonyTest):
         usage = disclosure.UsageStore(ledger)
         self.saved_state = dict(disclosure_server.STATE)
         disclosure_server.STATE.update({
-            "ledger": ledger, "client_secret": self.secret, "index_limit": 0,
+            "ledger": ledger, "client_secrets": {"application": self.secret}, "index_limit": 0,
             "usage": usage,
             "service": disclosure.DisclosureService(
                 sealing.RecordOpener(self.private_hex, self.kem), self.index_key,

@@ -70,10 +70,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from justikey import (audit, db, disclosure, registry, sealing,  # noqa: E402
-                      timeutil)
+                      servicekit, timeutil)
 
-MAX_BODY_BYTES = 8 * 1024 * 1024
-CLOCK_SKEW_SECONDS = 300
+# Body ceiling and clock window come from servicekit, so the two services
+# cannot drift apart on the limits that bound replay and resource use.
+MAX_BODY_BYTES = servicekit.MAX_BODY_BYTES
+CLOCK_SKEW_SECONDS = servicekit.CLOCK_SKEW_SECONDS
 
 # Just the ledger. This service stores no observations of its own: it opens
 # records on request and keeps the record of having done so.
@@ -177,66 +179,16 @@ def index_rate_ok():
         return True
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(servicekit.AuthenticatedHandler, BaseHTTPRequestHandler):
+    """Authentication and framing come from servicekit, shared with the
+    custodian: two copies of an authentication routine is how one of them
+    quietly loses a check."""
+
     server_version = "JustiKeyDisclosure/1.0"
-    protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt, *args):
-        pass
-
-    def _json(self, code, obj):
-        body = json.dumps(obj).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    # -- caller authentication -------------------------------------------
-
-    def _authenticated_body(self):
-        """Read and authenticate the request body, or respond and return None."""
-        try:
-            length = int(self.headers.get("Content-Length", 0) or 0)
-        except ValueError:
-            self._json(400, {"error": "invalid Content-Length"})
-            return None
-        if length > MAX_BODY_BYTES:
-            self.close_connection = True
-            self._json(413, {"error": "request body too large"})
-            return None
-        body = self.rfile.read(length) if length else b""
-
-        client = self.headers.get("X-JustiKey-Client-Id")
-        timestamp = self.headers.get("X-JustiKey-Timestamp")
-        nonce = self.headers.get("X-JustiKey-Nonce")
-        signature = self.headers.get("X-JustiKey-Signature")
-        if not all([client, timestamp, nonce, signature]):
-            self._json(401, {"error": "unauthenticated request"})
-            return None
-        try:
-            skew = abs((timeutil.now() - timeutil.parse_dt(timestamp)).total_seconds())
-        except ValueError:
-            self._json(401, {"error": "malformed timestamp"})
-            return None
-        if skew > CLOCK_SKEW_SECONDS:
-            self._json(401, {"error": "timestamp outside the accepted window"})
-            return None
-        expected = disclosure.request_signature(STATE["client_secret"], timestamp, nonce, body)
-        if not hmac.compare_digest(expected, signature):
-            record("client_auth_failed", f"client:{client[:64]}", {"reason": "bad signature"})
-            self._json(401, {"error": "invalid client signature"})
-            return None
-        # A valid signature is not enough: the whole request, headers included,
-        # stays valid for the clock window, so anyone who captured one could
-        # replay it verbatim. Each nonce is spendable once.
-        if not STATE["usage"].claim_transport_nonce(nonce, CLOCK_SKEW_SECONDS):
-            record("transport_replay_refused", f"client:{client[:64]}",
-                   {"reason": "request nonce already spent"})
-            self._json(401, {"error": "request nonce has already been used"})
-            return None
-        return body
+    @property
+    def state(self):
+        return STATE
 
     # -- routes -----------------------------------------------------------
 
@@ -254,13 +206,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in ("/index", "/disclose"):
             self._json(404, {"error": "not found"})
             return
-        body = self._authenticated_body()
-        if body is None:
-            return
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self._json(400, {"error": "invalid JSON"})
+        payload = self._payload()
+        if payload is None:
             return
 
         if self.path == "/index":
@@ -466,7 +413,10 @@ def main():
         conn.close()
 
     STATE["ledger"] = args.ledger
-    STATE["client_secret"] = args.client_secret
+    STATE["record"] = record
+    # One role here: the application. The custodian splits ingest from
+    # disclosure because it holds the index key; this service does not.
+    STATE["client_secrets"] = {"application": args.client_secret}
     STATE["index_limit"] = args.index_limit
     STATE["usage"] = disclosure.UsageStore(args.ledger)
     STATE["usage"].purge_expired()
