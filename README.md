@@ -728,6 +728,14 @@ local equivalent that means anything** and must be recorded as AWS evidence
 separately from the local suite. `tests/fake_kms.py` is a program this
 project wrote to agree with this project.
 
+One principle from that review generalises past KMS and is recorded in
+[threat-model.md](docs/threat-model.md): **a control expressed only in policy
+that the same principal can rewrite is not an independent control against
+that principal.** The disclosure cap, the key registries, the blind-index
+capability and the audit chain all became real controls by being *moved*
+somewhere the adversary under consideration cannot reach — not by being
+written more carefully.
+
 The runbook is also explicit that the KMS administration boundary is *not*
 in the key policy: `kms:PutKeyPolicy` is a path to future cryptographic
 access, so a principal that can rewrite the policy can grant itself use of

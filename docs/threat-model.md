@@ -323,6 +323,31 @@ correct, and it is deliberate: there is no fallback path that opens records
 without the service. The policy engine returns `disclosure_unavailable` and
 records stay sealed.
 
+## A cross-cutting principle
+
+Stated separately because it is not about one finding, and because this
+project got it wrong once after having already applied it correctly
+elsewhere:
+
+> **A control expressed only in policy that the same principal can rewrite is
+> not an independent control against that principal.**
+
+Where it has bitten, or been designed around:
+
+| Control | The principal that could rewrite it | What makes it independent |
+|---|---|---|
+| KMS key policy pinning the enclave measurement | anyone with `kms:PutKeyPolicy` — who can grant themselves `DeriveSharedSecret` with no attestation condition | an SCP or equivalent governance above the account, plus alarms on policy change |
+| The disclosure cap, when it lived in `policy.evaluate_disclosure()` | the application, which simply would not call it | the count moved to the disclosure service, then to the custodian |
+| The approver and requester registries | anyone who can write the file on the service host | versioning, with the version and digest committed to an externally anchored ledger |
+| The blind-index capability, when `/index` answered for any plate | the disclosure host, which also holds the archive | split into an ingest credential (no archive) and an approved-scope operation |
+| The audit chain itself | whoever holds the database | external anchoring to an independent witness |
+
+The pattern in every row is the same: the control did not become real by
+being written more carefully, but by being moved somewhere the adversary
+under consideration cannot reach. Where that move is impossible, the honest
+answer is to say so and record what the residual is — which is what the rest
+of this document does.
+
 ## Future stage: tokenization at the sensor
 
 The strongest version of finding 1 is to remove the application from the

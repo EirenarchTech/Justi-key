@@ -420,22 +420,42 @@ wired up what the code does, not that the code does it.
   custodian refuses this case (`custodian.py`), but a deployment where it
   happens is one where the attestation is not being applied at all.
 
-### The evidence record
+### The evidence package
 
-Keep it. A gate that passed once, against an EIF whose PCRs you did not write
-down, is a gate you will have to run again and cannot compare against.
+Keep it permanently. A gate that passed once, against an EIF whose
+measurements you did not write down, is a gate you will have to run again and
+cannot compare against.
+
+For **each of tests 2–6**, record all seven of these:
+
+| Field | Why it is in the bundle |
+|---|---|
+| exact EIF and PCR measurements, **and the enclave launch flags** | a `--debug-mode` enclave reports all-zero PCRs, so a denial from it proves nothing; without the flags an all-zero-PCR denial is indistinguishable from the intended policy working |
+| KMS key ARN / key id, and the key-policy digest | which policy was actually in force, comparable later |
+| SCP version or digest in effect | the administration boundary is not in the key policy (§3); this records whether the thing that makes it independent existed at the time |
+| request outcome and timestamp | the result, and when |
+| CloudTrail event id for each attempt | the independent record that the denial came from AWS rather than from anything in this repository |
+| on the valid attested path: whether `SharedSecret` was **absent** and `CiphertextForRecipient` **present** | the specific observation that separates a custodian from an expensive proxy |
+| on denied paths: the KMS error code and message | that it denied *for the intended reason*, not incidentally |
+
+That last column is the one most easily skipped and most worth having. A
+denial for the wrong reason — a malformed request, a missing permission, an
+expired signing certificate — looks identical in a pass/fail column to a
+denial because the attestation did not match.
+
+And for the run as a whole:
 
 ```
 run date, operator
-EIF sha256, launch flags (confirm NOT --debug-mode)
-PCR0, PCR1, PCR2  (and PCR3/PCR8 if pinned)
-KMS key ARN, key policy sha256, SCP present y/n
-test 1..12: pass/fail, CloudTrail event id for 2-6
 local suite: commit, test count, pass/fail
+tests 1, 7-12: pass/fail
 ```
 
-The CloudTrail event id matters for 2–6: it is the independent record that
-the denial came from AWS rather than from anything in this repository.
+**If tests 2, 3, 4 and 5 deny for the intended reasons and test 6 returns
+only `CiphertextForRecipient`**, that is the first genuinely external
+evidence in this project that the archive-walking oracle is blocked by a
+boundary outside JustiKey itself. Everything before it is this repository
+agreeing with this repository.
 
 ## 7. Migrating the production store
 
