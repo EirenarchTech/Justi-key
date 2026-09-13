@@ -93,8 +93,11 @@ COPY scripts/custodian_server.py /opt/justikey/scripts/
 COPY approvers.json requesters.json /opt/justikey/
 WORKDIR /opt/justikey
 
-# Acceptance-run configuration, baked in. See the warning below: this is a
-# TEST-ONLY arrangement and the values must be throwaway.
+# Configuration for the FIRST AWS RUN ONLY, baked in. An EIF contains
+# unencrypted copies of everything in it; AWS documents this and warns that
+# secrets must not be included. So these values must be ones whose secrecy
+# nothing is being tested — see "Two different kinds of AWS test" in section 5.
+# The index key and the disclosure client secret do NOT belong here.
 ARG CLIENT_SECRET
 ARG INDEX_KEY
 ARG KMS_KEY_ARN
@@ -362,22 +365,64 @@ runbook previously said configuration arrives "through the enclave's own
 configuration mechanism", which described a thing that does not exist. That
 is a real gap in the deployment story, not in the crypto core.
 
-**For this disposable acceptance run, use (1) with throwaway values.** The
-run is testing whether AWS enforces the attestation boundary, and adding a
-provisioning protocol to the same experiment adds a variable without
-answering that question. Generate a client secret and index key used nowhere
-else, bake them in, destroy the environment afterwards, and record in the
-evidence that configuration was baked — because a production EIF built the
-same way would be shipping its secrets to anyone who can read the file.
+### Two different kinds of AWS test
 
-Before production, a vsock bootstrap needs building: the custodian listens,
-receives its configuration as its first frame, and only then starts
-answering. The transport layer already frames and bounds messages, so it is
-a new operation rather than a new mechanism.
+An EIF holds **unencrypted** copies of its code and data. AWS documents this
+and warns against putting secrets in one. That single fact splits the AWS
+work into two runs that must not be conflated:
+
+**(a) Pure Nitro/KMS acceptance — gates 2 through 7.** PCR enforcement, the
+no-`Recipient` denial, `CiphertextForRecipient` present, `SharedSecret`
+absent, the altered-EIF denial. These ask whether *AWS* enforces the
+attestation boundary. No claim is being made about the secrecy of anything
+inside the image, so an entirely disposable baked value is fine: generate one
+used nowhere else, destroy the environment afterwards, and record in the
+evidence that configuration was baked.
+
+**(b) Full JustiKey Stage-5 acceptance — archive enumeration, parent
+compromise, index-key isolation, the HMAC and custodian credentials.** These
+ask whether a compromised *parent* can walk the archive. **Baking the index
+key into the EIF invalidates the premise.** A compromised parent possesses
+the EIF, and must be assumed able to recover its contents; a run that bakes
+the key and then reports that the parent could not enumerate has tested a
+parent weaker than the one in the threat model.
+
+**So the first AWS run does (a) only.** Do not build a provisioning system
+for it — adding a provisioning protocol to the same experiment adds a
+variable without answering the question that run exists to answer. Use the
+minimum disposable image that establishes gates 2–7.
+
+### The production bootstrap, and why it is not "parent sends the secret"
+
+Before Stage 5 can be called complete, (b) has to run against a custodian
+that received its configuration without the parent ever holding it. The
+obvious design — `parent --plaintext secret--> enclave` over vsock — does
+not achieve that: a compromised parent then knows what it provisioned, which
+is the same failure as baking, moved later in time.
+
+The shape that works uses the property already being bought from KMS:
+
+```
+encrypted configuration blob  ->  parent merely transports it  ->  vsock
+  ->  attested enclave  ->  KMS attested decrypt  ->  plaintext exists only here
+```
+
+The blob is encrypted to the same KMS key whose policy pins the enclave's
+PCRs, so the parent can carry it and cannot open it. That is preferable to
+inventing a custom secret-delivery protocol: it reuses a boundary already
+being tested rather than adding a second one that is not.
+
+The transport layer already frames and bounds messages, so this is a new
+operation rather than a new mechanism — the custodian listens, receives the
+blob as its first frame, decrypts it through the attested path, and only then
+starts answering. **JustiKey does not implement it yet**, and until it does,
+the results in (b) are local-only.
 
 ### What has to reach it
 
-Move these into the enclave (baked, for the acceptance run):
+Move these into the enclave. For the first AWS run only, disposable
+stand-ins for the last two rows may be baked in; the real values require the
+bootstrap above.
 
 | Item | Where it comes from | Notes |
 |---|---|---|
@@ -425,11 +470,17 @@ unambiguous, and cheap enough to throw away and rebuild when a gate fails:
 ```
 
 **Do not put real plate data behind this until every gate passes.** A
-deployment that passes eleven of twelve is not 92% secure; it has one
+deployment that passes twelve of thirteen is not 92% secure; it has one
 specific hole, and you now know which.
 
 Run them in this order. The order matters: each one establishes a fact the
 next depends on.
+
+**The first AWS run is gates 2–7 only.** Gates 9 and 10 are marked below as
+requiring the provisioning bootstrap (§5): run against a baked acceptance
+EIF they measure a parent that does not hold the index key, which is not the
+parent in the threat model. Their local results stand until then; what they
+do not yet have is an AWS result that means anything.
 
 | # | Test | Expected | Evidence |
 |---|---|---|---|
@@ -441,8 +492,8 @@ next depends on.
 | 6 | Valid attested operation | `CiphertextForRecipient` present, `SharedSecret` **absent** | **AWS only** |
 | 7 | Parent **copies a valid attestation document** and calls KMS itself | a response may return; the parent **cannot recover the secret** | **AWS only** |
 | 8 | Ciphertext delivered to the wrong per-operation RSA key | **REFUSE** | local + AWS |
-| 9 | One approval against every row | exactly one authorized row | local + AWS |
-| 10 | `/index` enumeration from the disclosure side | zero useful tokens | local + AWS |
+| 9 | One approval against every row | exactly one authorized row | local; **AWS only after the §5 bootstrap** |
+| 10 | `/index` enumeration from the disclosure side | zero useful tokens | local; **AWS only after the §5 bootstrap** |
 | 11 | Forged approval to `search-token` | zero tokens | local + AWS |
 | 12 | Replay presence / approval | **REFUSE** | local + AWS |
 | 13 | Cap race | never exceeds remaining uses | local + AWS |
@@ -486,7 +537,10 @@ about.
 Tests 8–13 have local equivalents that pass
 (`test_custodian.py`, `test_custodian_process.py`, `test_index_oracle.py`,
 `test_transport.py`). Running them again on AWS confirms the deployment
-wired up what the code does, not that the code does it.
+wired up what the code does, not that the code does it — with the exception
+of 9 and 10, which on AWS are claims about what a compromised parent can
+reach, and are therefore only meaningful once the parent no longer holds the
+index key (§5).
 
 ### If a gate fails
 
@@ -630,7 +684,7 @@ returns `disclosure_unavailable` rather than degrading.
 
 Everything above was written against AWS's documented behaviour and a local
 test suite of 421 tests. The parts that depend on AWS actually behaving as
-documented — tests 2 through 6 — have never been executed by this project.
+documented — tests 2 through 7 — have never been executed by this project.
 `tests/fake_kms.py` implements those semantics so the JustiKey side is
 testable, and proves nothing whatever about AWS: it is a program this project
 wrote to agree with this project.
@@ -639,6 +693,13 @@ Run the suite on a throwaway key and a throwaway archive first. If test 3 or
 test 6 does not behave as this document says, **stop** and re-read the
 current AWS documentation before going further. Those two are the difference
 between a custodian and an expensive proxy.
+
+Nor can passing gates 2–7 alone be reported as "Stage 5 verified". They
+establish that AWS enforces the attestation boundary. The JustiKey claim —
+that a compromised disclosure host cannot walk the archive — additionally
+requires that the host never held the index key, and that requires the
+provisioning bootstrap in §5, which is not built. Two runs, two claims; do
+not let the first one's evidence be filed under the second one's heading.
 
 One more thing this runbook cannot do: it cannot tell you that the
 administration boundary in §3 is enforced in *your* organization. The SCP

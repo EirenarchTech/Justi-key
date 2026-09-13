@@ -365,12 +365,27 @@ Where it has bitten, or been designed around:
 | The approver and requester registries | anyone who can write the file on the service host | versioning, with the version and digest committed to an externally anchored ledger |
 | The blind-index capability, when `/index` answered for any plate | the disclosure host, which also holds the archive | split into an ingest credential (no archive) and an approved-scope operation |
 | The audit chain itself | whoever holds the database | external anchoring to an independent witness |
+| The custodian's index key, when baked into the enclave image | the parent, which holds the EIF file and can read it | a bootstrap where the parent transports a KMS-encrypted blob it cannot open — **not built** |
 
 The pattern in every row is the same: the control did not become real by
 being written more carefully, but by being moved somewhere the adversary
 under consideration cannot reach. Where that move is impossible, the honest
 answer is to say so and record what the residual is — which is what the rest
 of this document does.
+
+The last row is the live one, and it has a near relative worth stating
+directly: **a secret stored inside something the adversary already possesses
+is not a secret from that adversary.** An Enclave Image File contains
+unencrypted copies of its code and data — AWS documents this and warns
+against putting secrets in one — and a compromised parent instance holds the
+EIF. So a deployment that bakes the blind-index key into the image and then
+observes that the parent could not enumerate the archive has tested a parent
+weaker than finding 1 and finding 2 assume. The measurement is not wrong; it
+is answering a different question. Nitro/KMS gates that claim nothing about
+the image's secrecy (attestation enforcement, `SharedSecret` absent, a
+modified EIF denied) are unaffected and can be run first. The archive and
+index attacks against a real deployment cannot, until the bootstrap in the
+table's last row exists.
 
 ## Future stage: tokenization at the sensor
 

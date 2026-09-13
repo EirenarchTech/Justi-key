@@ -372,9 +372,25 @@ JustiKey behaves correctly given that behaviour. They are not evidence about
 AWS.** Confirming the real service behaves as documented is a deployment
 step, not a unit test.
 
+There is a second place the evidence stops, and it is about the *parent*
+rather than about AWS. An EIF contains unencrypted copies of its code and
+data, and `nitro-cli run-enclave` has no way to pass configuration to the
+application inside it — so the first AWS run bakes its configuration into the
+image. A compromised parent possesses that image. Any result from such a run
+about archive enumeration or index-key isolation is therefore measuring a
+weaker parent than the threat model assumes, and is not Stage-5 evidence;
+only gates 2–7, which claim nothing about the secrecy of the image, are.
+Closing this needs a bootstrap in which the parent transports a
+KMS-encrypted configuration blob it cannot open and the attested enclave
+decrypts it through the same path the custodian already uses — reusing the
+boundary being tested rather than inventing a second one. It is not built,
+and Stage 5 is not complete until it is and the archive and index attacks
+have been rerun against it.
+
 What remains is no longer code-shaped. The NSM attestation request needs the
 device; the vsock round trip needs a kernel with vsock routing; the KMS
-behaviour needs KMS. Each is a named refusal or a stated gap rather than a
+behaviour needs KMS; the provisioning bootstrap above needs a real attested
+enclave to be worth writing against. Each is a named refusal or a stated gap rather than a
 stub, and the next meaningful evidence is a small real Nitro + KMS
 deployment rather than another stand-in. The v3 → v4 reseal is available
 through the existing ceremony but has not been run against a production
@@ -413,13 +429,15 @@ environment variable must not be able to reinterpret records already sealed.
 [nitro-deployment-runbook.md](nitro-deployment-runbook.md) is the executable
 version of this design: parent instance, EIF build and PCR measurements, the
 KMS key policy pinned to the measurement, vsock-proxy, credential placement,
-and twelve acceptance gates.
+and thirteen acceptance gates.
 
-Three of those gates — modified EIF denied, parent direct call denied,
-`SharedSecret` empty on an attested response — are assertions about AWS, and
-no local test can answer them. They are the difference between a custodian
-and an expensive proxy, which is why the runbook says to stop if either of
-the last two does not behave as documented.
+Six of those gates — 2 through 7: a call with no `Recipient` denied, a
+mismatched attestation denied, a modified EIF denied, the wrong PCR denied,
+`CiphertextForRecipient` present with `SharedSecret` empty, and a parent
+replaying a copied attestation unable to decrypt what comes back — are
+assertions about AWS, and no local test can answer them. They are the
+difference between a custodian and an expensive proxy, which is why the
+runbook says to stop if gate 3 or gate 6 does not behave as documented.
 
 ## Decided
 
