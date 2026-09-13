@@ -83,6 +83,25 @@ The custodian runs from a Docker image converted to an Enclave Image File.
 Keep the image minimal: it is measured, and every byte in it is part of what
 the KMS key policy will pin.
 
+> **Execution order is not section order, and there is a loop here.** The
+> Dockerfile bakes the KMS key ARN and the custodian public key, so the key
+> must exist before the image is built — but the key *policy* pins PCRs,
+> which do not exist until the image is built. Break the loop by creating the
+> key first and tightening its policy afterwards:
+>
+> 1. **§3, part one** — create the P-256 `KEY_AGREEMENT` key with a policy
+>    that grants `DeriveSharedSecret` to no one. Record the ARN; export the
+>    public key.
+> 2. **§2** — build the image and the EIF with those two values baked in.
+>    Record PCR0, PCR1, PCR2.
+> 3. **§3, part two** — `put-key-policy` with the real attestation
+>    conditions, now that there are measurements to pin.
+> 4. **§6** — run the gates.
+>
+> Baking a placeholder ARN instead and fixing it later does not work: the
+> rebuild changes PCR0 and PCR2, so the policy written against the first
+> build stops matching. Every change to the image is a new measurement.
+
 ```dockerfile
 # Dockerfile.custodian
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:PIN_THIS_DIGEST
