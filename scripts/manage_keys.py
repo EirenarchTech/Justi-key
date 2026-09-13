@@ -41,7 +41,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from justikey import audit, config, custody, db, models, webauthn  # noqa: E402
+from justikey import (audit, config, custody, db, models,  # noqa: E402
+                      registry, webauthn)
 
 ROLES = ("requester", "approver")
 
@@ -151,24 +152,38 @@ def cmd_export(args, conn):
     for path, role in ((args.approvers, "approver"), (args.requesters, "requester")):
         if not path:
             continue
-        registry = registry_for(conn, role)
+        principals = registry_for(conn, role)
+
+        # Version moves forward only when the contents actually change.
+        # Bumping on every export would train the service's operators to
+        # expect version changes, which is exactly when a swapped registry
+        # stops standing out.
+        previous_version, previous = 0, None
+        if os.path.exists(path):
+            with open(path, "r") as fh:
+                previous_version, previous = registry.unwrap(json.load(fh))
+        changed = previous is None or registry.digest(previous) != registry.digest(principals)
+        version = previous_version + 1 if changed else previous_version
+
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
-            json.dump(registry, fh, indent=2, sort_keys=True)
+            json.dump(registry.wrap(principals, version), fh, indent=2, sort_keys=True)
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
-        hardware = sum(1 for entry in registry.values() if entry.get("webauthn"))
-        revoked = sum(1 for entry in registry.values() if entry["revoked"])
-        print(f"{path}: {len(registry)} {role}(s), {hardware} on hardware, "
-              f"{revoked} revoked")
+        hardware = sum(1 for entry in principals.values() if entry.get("webauthn"))
+        revoked = sum(1 for entry in principals.values() if entry["revoked"])
+        print(f"{path}: v{version} ({'changed' if changed else 'unchanged'}), "
+              f"{len(principals)} {role}(s), {hardware} on hardware, {revoked} revoked")
     audit.append_event(conn, "key_registry_exported", args.actor, {
         "approvers": bool(args.approvers), "requesters": bool(args.requesters)})
     print("\nMove these to the disclosure service's host and restart it with")
     print("--approvers / --requesters. The service reads them there and never asks")
     print("this application, which is what stops a compromised application from")
     print("choosing whose keys count.")
+    print("\nThe version is what stops an older copy being restored later: the")
+    print("service records it and refuses to start on anything lower.")
 
 
 COMMANDS = {"list": cmd_list, "enrol": cmd_enrol, "revoke": cmd_revoke, "export": cmd_export}

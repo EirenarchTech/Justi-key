@@ -103,26 +103,56 @@ class UsageStore:
         from . import db
         return db.get_connection(self.db_path)
 
-    def claim(self, nonce, authorization_id, expires_at, limit):
-        """Consume one use of an approval. Returns (ok, count, reason).
+    def claim(self, nonce, authorization_id, expires_at, limit,
+              presence_nonce=None, presence_expires_at=None):
+        """Spend everything one disclosure consumes, or nothing. Returns
+        (ok, count, reason).
 
-        Read and increment happen inside one BEGIN IMMEDIATE transaction, so
-        concurrent requests cannot both observe count 25 and both proceed.
+        The approval's count and the requester's proof of presence are spent
+        in ONE transaction. Two transactions would leave a window where a
+        crash, or a concurrent request losing a race, burned a human
+        confirmation without the disclosure it paid for -- or, worse, spent
+        the approval while the presence nonce insert failed, so the same proof
+        stayed live.
+
+        Two independent mechanisms guard each one, deliberately:
+
+          BEGIN IMMEDIATE    serializes read-then-increment, so concurrent
+                             requests cannot both observe count 25
+          PRIMARY KEY        presence_nonces.nonce is unique, so even if the
+                             logic above were wrong, the database refuses a
+                             second spend of the same proof
+
+        The uniqueness constraint is the backstop. It is the one that holds
+        when the reasoning does not.
         """
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                now = timeutil.now_iso()
+                if presence_nonce is not None:
+                    conn.execute("DELETE FROM presence_nonces WHERE expires_at < ?", (now,))
+                    spent = conn.execute(
+                        "INSERT OR IGNORE INTO presence_nonces (nonce, expires_at, used_at) "
+                        "VALUES (?,?,?)",
+                        (presence_nonce, presence_expires_at or expires_at, now))
+                    if spent.rowcount != 1:
+                        conn.execute("COMMIT")
+                        return False, 0, ("this proof of presence has already been used; "
+                                          "the requester must confirm again")
+
                 row = conn.execute(
                     "SELECT disclosure_count, expires_at FROM authorization_usage "
                     "WHERE nonce=?", (nonce,)).fetchone()
-                now = timeutil.now_iso()
                 if row is not None and now > row["expires_at"]:
-                    conn.execute("COMMIT")
+                    conn.execute("ROLLBACK")
                     return False, row["disclosure_count"], "approval has expired"
                 count = row["disclosure_count"] if row else 0
                 if limit > 0 and count >= limit:
-                    conn.execute("COMMIT")
+                    # Rolled back, not committed: a request refused by the cap
+                    # must not also cost the requester their confirmation.
+                    conn.execute("ROLLBACK")
                     return False, count, (
                         f"this approval has already been used {count} times; "
                         f"the limit is {limit}")
@@ -175,6 +205,37 @@ class UsageStore:
                 "INSERT OR IGNORE INTO presence_nonces (nonce, expires_at, used_at) "
                 "VALUES (?,?,?)", (nonce, expires_at, timeutil.now_iso()))
             return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    def sign_count(self, credential_id):
+        """The highest counter this verifier has seen for a credential.
+
+        Owned here rather than in the registry file, so that a counter
+        advancing during normal use never looks like a change to whose keys
+        count -- and so that re-exporting a registry cannot silently reset a
+        counter back to zero, which would disarm the cloned-authenticator
+        check entirely.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT sign_count FROM webauthn_counters WHERE credential_id=?",
+                (credential_id,)).fetchone()
+            return row["sign_count"] if row else None
+        finally:
+            conn.close()
+
+    def record_sign_count(self, credential_id, count):
+        """Persist a counter, never downwards."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO webauthn_counters (credential_id, sign_count, last_used_at) "
+                "VALUES (?,?,?) ON CONFLICT(credential_id) DO UPDATE SET "
+                "sign_count=MAX(sign_count, excluded.sign_count), "
+                "last_used_at=excluded.last_used_at",
+                (credential_id, count, timeutil.now_iso()))
         finally:
             conn.close()
 
@@ -255,10 +316,18 @@ class DisclosureService:
         if entry is None:
             return None
         try:
-            return custody.credential_from_registry(
+            credential = custody.credential_from_registry(
                 entry, rp_id=config.WEBAUTHN_RP_ID, origin=config.WEBAUTHN_ORIGIN)
         except custody.CustodyError as exc:
             raise DisclosureError(f"requester {username!r}: {exc}") from exc
+
+        # The registry's counter is only a starting point; what this verifier
+        # has actually seen wins, and never goes down.
+        if custody.is_hardware(credential) and self._usage is not None:
+            seen = self._usage.sign_count(credential["credential_id"])
+            if seen is not None:
+                credential["sign_count"] = max(credential.get("sign_count") or 0, seen)
+        return credential
 
     def verify_presence(self, statement, requester, proof_statement, proof):
         """Require evidence the requester is actually here, if policy says so.
@@ -282,9 +351,13 @@ class DisclosureService:
         try:
             result = presence.verify(
                 credential, proof_statement, proof, statement, requester,
-                require_user_verification=config.WEBAUTHN_REQUIRE_USER_VERIFICATION)
+                require_user_verification=config.require_user_verification("requester"))
         except presence.PresenceError as exc:
             raise DisclosureError(str(exc)) from exc
+        if result.get("custody") == "hardware" and self._usage is not None:
+            # Persist before the disclosure proceeds. A verifier that checks
+            # the counter and forgets to store it is checking nothing.
+            self._usage.record_sign_count(result["credential_id"], result["sign_count"])
         self._local.presence = result
         return result
 
@@ -330,26 +403,21 @@ class DisclosureService:
         if statement["requester"] != requester:
             raise DisclosureError("this approval belongs to another requester")
 
-        # Presence first, and before any use is spent: a request that cannot
+        # Presence is verified before anything is spent: a request that cannot
         # show the requester is here must not consume the approval's budget,
         # or refusing it would still cost the officer a disclosure.
         presence_result = self.verify_presence(statement, requester, proof_statement, proof)
-        if presence_result is not None and self._usage is not None:
-            # One proof, one disclosure. Without this the proof is good for
-            # its whole TTL and a captured one buys a burst.
-            if not self._usage.claim_presence_nonce(
-                    presence_result["request_nonce"], statement["approval_expires_at"]):
-                raise DisclosureError(
-                    "this proof of presence has already been used; the requester "
-                    "must confirm again")
 
-        # Consume a use before opening anything. A compromised application can
-        # present a genuine approval repeatedly; the count that stops it has to
-        # live here rather than in the caller that chose to send the request.
+        # Then spend both in one transaction. The approval's count stops a
+        # compromised application replaying a genuine approval; the presence
+        # nonce makes one human confirmation buy exactly one disclosure. They
+        # commit together or not at all -- see UsageStore.claim.
         if self._usage is not None:
             ok, count, reason = self._usage.claim(
                 statement["nonce"], statement.get("authorization_id"),
-                statement["approval_expires_at"], self.max_disclosures)
+                statement["approval_expires_at"], self.max_disclosures,
+                presence_nonce=(presence_result or {}).get("request_nonce"),
+                presence_expires_at=(proof_statement or {}).get("expires_at"))
             if not ok:
                 self._local.use_count = None
                 raise DisclosureError(reason)

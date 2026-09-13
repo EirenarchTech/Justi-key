@@ -44,7 +44,15 @@ still query for arbitrary inputs. **The real fix is tokenization at the
 camera**, so the ordinary server never handles a plate it could ask about —
 see the future stage below.
 
-## 2. Compromise of the disclosure service
+## 2. Compromise of the disclosure service — the next target
+
+The service holds the disclosure private key in process memory, so
+compromising that process yields a reusable archive-decryption secret. Every
+other control is downstream of that. This is the open finding stage 5
+addresses; see [capability-model.md](capability-model.md) for the objective
+and the attack suite it has to survive.
+
+
 
 The service holds the disclosure private key and the index key, so
 compromising it yields the archive. Risk is concentrated, not eliminated.
@@ -164,6 +172,34 @@ lives, and the difference is the whole reason stage 4 has two halves:
 | Software, password-wrapped | mint further proofs *while it holds the unwrapped key* — i.e. during moments the officer is actually present and working, and not afterwards |
 | Hardware (WebAuthn) | obtain a proof only for a challenge a present human physically confirmed, one touch at a time, and none afterwards |
 
+### What a hardware assertion does and does not prove
+
+Worth stating precisely, because the temptation is to round it up.
+
+**It proves:** the enrolled authenticator participated; a user was present at
+it (the UP flag, which this implementation requires unconditionally and
+offers no way to disable); and, for roles where UV is required, that the
+operator authenticated *to the authenticator* with a PIN or biometric rather
+than merely touching a token someone found.
+
+**It does not prove the person understood the transaction they confirmed.** A
+commodity security key has no display. It shows a blinking light, not a plate
+number and a case number. Whatever the relying party puts in the challenge,
+what the human actually reads is a browser prompt rendered by software which
+— in the threat model this system is built for — may be the compromised
+component. A compromised application can therefore describe one operation on
+screen and put a different one in the challenge, and the assertion will be
+cryptographically perfect either way.
+
+Closing that needs an authenticator with a **trusted display** that renders
+the transaction itself, and no such device is assumed here. So the claim this
+system makes is "the enrolled operator confirmed an operation", never "the
+operator agreed to these specific terms". The scope bounds are what constrain
+*which* operation a confirmation can be spent on: the proof is bound to one
+approval nonce and one statement digest, so a confirmation obtained under
+false pretences is still worth exactly one disclosure inside a scope an
+approver independently signed.
+
 So the honest claim is no longer "an approval is a bearer capability". It is:
 **a live approval plus a present requester is a bearer capability for that
 moment**, and with hardware custody, for that single confirmed operation. A
@@ -189,7 +225,34 @@ records fails the tag check. The record uid is generated at seal time rather
 than taken from the row id, which the database — and therefore an attacker
 with SQL — controls.
 
-## 7. Audit integrity
+## 7. Registry integrity
+
+The disclosure service decides whose approvals and whose proofs of presence it
+accepts by reading two files on its own host. The application cannot write
+them — that is stage 3 — which says nothing about an attacker who reaches the
+service host or the path those files travel. Two attacks a bare JSON file
+does not resist:
+
+| Attack | What it achieves | What refuses it |
+|---|---|---|
+| Replacement | enrol a key the attacker holds; every later approval verifies perfectly | contents changed without the version moving — the service will not start |
+| Rollback | restore yesterday's copy, reinstating a key revoked since | version lower than one already recorded — the service will not start |
+
+A digest alone catches neither, because the attacker recomputes it. What
+catches them is comparison against state the service already committed to its
+own append-only, externally anchored ledger, checked at startup before it
+answers anything.
+
+**This is detection and refusal, not prevention.** An attacker who owns the
+service host owns the ledger too. What it buys is that changing whose keys
+count stops being free and silent: it has to survive the anchored chain, which
+is the same bet the audit trail already makes. WebAuthn sign counters are
+deliberately kept in the service's database rather than the registry file, so
+routine use never rewrites the file whose digest is committed — otherwise
+every disclosure would look like a configuration change, and a real one would
+not stand out.
+
+## 8. Audit integrity
 
 The application and the disclosure service each keep their own hash-chained
 ledger. Appends are serialized (`BEGIN IMMEDIATE`, plus an in-process lock in
@@ -203,7 +266,7 @@ The disclosure ledger deliberately does **not** record the plate involved in
 a scope-token request. Logging it would rebuild the archive the service
 exists to protect.
 
-## 8. Availability as a safety property
+## 9. Availability as a safety property
 
 If the disclosure service is unreachable, lawful access stops. That is
 correct, and it is deliberate: there is no fallback path that opens records

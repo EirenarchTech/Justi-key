@@ -487,6 +487,10 @@ than two sets of bugs:
 
 The challenge the authenticator signs is the **digest of the exact statement
 being authorized**, so an assertion is good for that statement and no other.
+User presence is required unconditionally and has no off switch; user
+verification (PIN or biometric — the enrolled operator, not whoever picked
+the token up) is required per role via `JUSTIKEY_WEBAUTHN_REQUIRE_UV`,
+defaulting to every role.
 Verification (`justikey/webauthn.py`) checks the signature, the ceremony
 type, the challenge, the origin, the RP id, the user-present and
 user-verified flags, and the signature counter — each a separate attack, each
@@ -524,6 +528,23 @@ python3 scripts/disclosure_server.py --port 8090 ... \
 requester who has a key, so a deployment can enrol people gradually;
 `required` refuses any disclosure without one.
 
+**What an assertion proves, exactly.** That the enrolled authenticator
+participated, that a user was present at it, and — where UV is required —
+that the operator authenticated to the authenticator. It does **not** prove
+the person understood the transaction: a commodity security key has no
+display, so what the human reads is a browser prompt rendered by software
+that may itself be the compromised component. Only a trusted-display
+authenticator would close that. The scope binding is what limits the damage:
+a confirmation obtained under false pretences is still worth one disclosure,
+inside a scope an approver independently signed.
+
+**Registry integrity.** The registries are versioned, and the service commits
+each version and digest to its own ledger. A registry whose contents changed
+without the version moving, or whose version went backwards, refuses to start
+the service — the two shapes a swapped or rolled-back registry takes. This is
+detection, not prevention: an attacker who owns the service host owns its
+ledger too. See [threat-model.md](docs/threat-model.md) finding 7.
+
 **Not built:** the browser pages that run the WebAuthn registration and
 assertion ceremonies. Verification and enrolment are complete and tested
 against a synthetic authenticator (`tests/authenticator.py`) that produces
@@ -543,6 +564,7 @@ architecture. These were previously human expectations only:
 | Disclosures per approval | `JUSTIKEY_MAX_DISCLOSURES` / `--max-disclosures` | 25 |
 | Proof-of-presence mode | `JUSTIKEY_PRESENCE_MODE` / `--presence-mode` | enrolled |
 | Proof-of-presence lifetime | `JUSTIKEY_PRESENCE_TTL` | 120s |
+| Roles needing hardware user verification | `JUSTIKEY_WEBAUTHN_REQUIRE_UV` | all |
 | Failed sign-ins before lockout | `JUSTIKEY_MAX_FAILED_LOGINS` | 5 |
 | Lockout duration | `JUSTIKEY_LOCKOUT_SECONDS` | 900 |
 | Observation retention | `JUSTIKEY_RETENTION_DAYS` | 365 days |

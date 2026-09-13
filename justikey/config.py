@@ -116,11 +116,28 @@ PRESENCE_MAX_TTL_SECONDS = int(os.environ.get("JUSTIKEY_PRESENCE_MAX_TTL", 300))
 # some other site would otherwise be indistinguishable from one for this one.
 WEBAUTHN_RP_ID = os.environ.get("JUSTIKEY_WEBAUTHN_RP_ID") or None
 WEBAUTHN_ORIGIN = os.environ.get("JUSTIKEY_WEBAUTHN_ORIGIN") or None
-# Whether an authenticator must report user verification (PIN or biometric)
-# and not merely presence. A touch proves someone is there; verification
-# proves it is the person enrolled.
-WEBAUTHN_REQUIRE_USER_VERIFICATION = os.environ.get(
-    "JUSTIKEY_WEBAUTHN_REQUIRE_UV", "1") == "1"
+# User presence (UP) is NOT configurable: an assertion without it is refused
+# outright, because "the authenticator produced a signature" with nobody
+# touching it is not evidence of anything a human did.
+#
+# User verification (UV) is the stronger claim -- the enrolled operator
+# authenticated *to the authenticator* with a PIN or biometric, rather than
+# someone merely touching a token they found. Which roles must clear that bar
+# is a deployment decision, so it is per role: a comma-separated list, or
+# "all" / "none".
+WEBAUTHN_REQUIRE_UV_ROLES = tuple(
+    part.strip().lower()
+    for part in os.environ.get("JUSTIKEY_WEBAUTHN_REQUIRE_UV", "all").split(",")
+    if part.strip())
+
+
+def require_user_verification(role):
+    """Whether this role's hardware assertions must carry the UV flag."""
+    if "none" in WEBAUTHN_REQUIRE_UV_ROLES:
+        return False
+    if "all" in WEBAUTHN_REQUIRE_UV_ROLES:
+        return True
+    return (role or "").lower() in WEBAUTHN_REQUIRE_UV_ROLES
 
 # --- Brute-force resistance ------------------------------------------------
 MAX_FAILED_LOGINS = int(os.environ.get("JUSTIKEY_MAX_FAILED_LOGINS", 5))

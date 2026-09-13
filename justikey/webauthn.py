@@ -23,6 +23,21 @@ window shrinks from "whenever the password is typed, plus whatever the
 attacker kept" to "exactly the operations a present human physically
 confirmed".
 
+WHAT AN ASSERTION DOES NOT PROVE
+
+It proves that the enrolled authenticator participated and that a user was
+present at it (UP), and, where UV is required, that the operator
+authenticated to the authenticator with a PIN or biometric. It does **not**
+prove the person understood the transaction they confirmed. A commodity
+security key has no display: it shows a blinking light, not a plate number
+and a case. Whatever the relying party puts in the challenge, the human sees
+a browser prompt written by software that -- in the threat model this whole
+system is built for -- may be compromised. Only an authenticator with a
+trusted display, showing the transaction itself, would close that, and no
+such device is assumed here. So the claim is "the enrolled operator
+confirmed an operation", never "the operator agreed to these specific
+terms".
+
 WHAT IS VERIFIED
 
     signature over  authenticatorData || SHA-256(clientDataJSON)
@@ -31,8 +46,9 @@ and, separately:
 
     clientDataJSON  type is the expected ceremony, challenge matches the one
                     we issued, origin is ours
-    authData        rpIdHash matches our RP ID, user-present flag set,
-                    user-verified flag set when we require it
+    authData        rpIdHash matches our RP ID, user-present flag set
+                    (always -- this one has no off switch), user-verified
+                    flag set for roles that require it
     signCount       strictly increases, which is how a cloned authenticator
                     shows up
 
@@ -274,6 +290,11 @@ def verify_assertion(credential, assertion, challenge, rp_id, origin,
     auth_data = parse_authenticator_data(auth_data_raw)
     if not _equal(auth_data["rp_id_hash"], hashlib.sha256(rp_id.encode("utf-8")).digest()):
         raise WebAuthnError("assertion is for a different relying party")
+    # Not configurable, and deliberately so. An assertion the authenticator
+    # produced with nobody touching it is not evidence that a human did
+    # anything, and every claim built on top of this ("the requester is
+    # present") would be false. There is no deployment for which turning this
+    # off is the right trade.
     if not auth_data["user_present"]:
         raise WebAuthnError("the authenticator did not report a present user")
     if require_user_verification and not auth_data["user_verified"]:

@@ -47,7 +47,16 @@ Approver public keys live here, in --approvers, not in the request. A
 compromised application presenting its own key is the attack this defeats, so
 the service never accepts a key from its caller.
 
-    {"supervisor1": {"public_key": "<hex>", "revoked": false}}
+    {"version": 4,
+     "principals": {"supervisor1": {"public_key": "<hex>", "revoked": false}}}
+
+REGISTRY INTEGRITY
+
+Deciding whose keys count is privileged configuration, so the registries are
+versioned and their digests are committed to this service's own ledger. A
+registry whose version went backwards, or whose contents changed without the
+version moving, refuses to start the service -- see justikey/registry.py for
+which attacks that does and does not stop.
 """
 import argparse
 import hmac
@@ -60,7 +69,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from justikey import audit, db, disclosure, sealing, timeutil  # noqa: E402
+from justikey import (audit, db, disclosure, registry, sealing,  # noqa: E402
+                      timeutil)
 
 MAX_BODY_BYTES = 8 * 1024 * 1024
 CLOCK_SKEW_SECONDS = 300
@@ -93,6 +103,20 @@ CREATE TABLE IF NOT EXISTS authorization_usage (
     last_used_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_authorization_usage_expiry ON authorization_usage(expires_at);
+
+-- WebAuthn signature counters, owned by the verifying side.
+--
+-- Deliberately NOT kept in the registry file: that file is declarative
+-- configuration whose digest is committed to the ledger, and a counter
+-- advancing on every use would make routine activity indistinguishable from
+-- someone changing whose keys count. Keeping it here also means re-exporting
+-- a registry cannot silently reset a counter to zero, which would disarm the
+-- cloned-authenticator check.
+CREATE TABLE IF NOT EXISTS webauthn_counters (
+    credential_id TEXT PRIMARY KEY,
+    sign_count INTEGER NOT NULL,
+    last_used_at TEXT NOT NULL
+);
 
 -- Proofs that the requester was present, spendable once each. An approval
 -- may be used N times, but each human confirmation authorizes one of them.
@@ -284,15 +308,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(409, {"error": str(exc)})
             return
 
-        # Persist the authenticator's counter. A verifier that checks the
-        # counter but never stores the new value is checking nothing.
-        proved = STATE["service"].last_presence or {}
-        if proved.get("custody") == "hardware":
-            entry = STATE["service"].requesters.get(requester, {}).get("webauthn")
-            if entry is not None:
-                entry["sign_count"] = proved["sign_count"]
-                save_requesters()
-
         # Recorded before the response is written: an opening that reached the
         # caller but not the ledger would be exactly the gap that matters.
         record("disclosure_granted", f"requester:{requester}", {
@@ -307,6 +322,45 @@ class Handler(BaseHTTPRequestHandler):
             "presence": (STATE["service"].last_presence or {}).get("custody", "none"),
             "candidates": len(rows), "opened": len(opened)})
         self._json(200, {"opened": opened})
+
+
+def get_meta(conn, key):
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_meta(conn, key, value):
+    conn.execute("INSERT INTO meta (key, value) VALUES (?,?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+
+def admit_registry(ledger, role, path):
+    """Load a registry and refuse it if it rolled back or was swapped.
+
+    Called at startup, before the service will answer anything. A registry
+    that cannot be admitted is a configuration failure, not a degraded mode:
+    continuing would mean answering requests against keys whose provenance
+    the service has just discovered it cannot account for.
+    """
+    version, principals = registry.unwrap(read_registry_file(path)) if path else (0, {})
+    conn = db.get_connection(ledger)
+    try:
+        recorded = get_meta(conn, registry.REGISTRY_VERSION_KEY % role)
+        last_version = int(recorded) if recorded is not None else None
+        last_digest = get_meta(conn, registry.REGISTRY_DIGEST_KEY % role)
+        status, detail = registry.check(role, version, principals,
+                                        last_version, last_digest)
+        if status != "unchanged":
+            set_meta(conn, registry.REGISTRY_VERSION_KEY % role, version)
+            set_meta(conn, registry.REGISTRY_DIGEST_KEY % role, detail["digest"])
+        return principals, status, detail
+    finally:
+        conn.close()
+
+
+def read_registry_file(path):
+    with open(path, "r") as fh:
+        return json.load(fh)
 
 
 def load_registry(path, role):
@@ -330,9 +384,12 @@ def load_registry(path, role):
     """
     if not path:
         return {}
-    with open(path, "r") as fh:
-        data = json.load(fh)
-    registry = {}
+    _, data = registry.unwrap(read_registry_file(path))
+    return parse_registry(data, role)
+
+
+def parse_registry(data, role):
+    parsed = {}
     for username, entry in data.items():
         if not isinstance(entry, dict) or "public_key" not in entry:
             raise ValueError(f"{role} {username!r} needs a public_key")
@@ -345,29 +402,12 @@ def load_registry(path, role):
                     raise ValueError(
                         f"{role} {username!r}: webauthn enrolment needs {field}")
             record["webauthn"] = dict(hardware)
-        registry[username] = record
-    return registry
+        parsed[username] = record
+    return parsed
 
 
 def load_approvers(path):
     return load_registry(path, "approver")
-
-
-def save_requesters():
-    """Write the requester registry back, so sign counts survive a restart.
-
-    A WebAuthn counter that resets on restart stops being able to detect a
-    cloned authenticator, which is the only thing it is for.
-    """
-    path = STATE.get("requesters_path")
-    if not path:
-        return
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(STATE["service"].requesters, fh, indent=2, sort_keys=True)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
 
 
 def main():
@@ -420,14 +460,25 @@ def main():
     STATE["index_limit"] = args.index_limit
     STATE["usage"] = disclosure.UsageStore(args.ledger)
     STATE["usage"].purge_expired()
-    STATE["requesters_path"] = args.requesters
+
+    # Admit the registries before answering anything. A rollback or a silent
+    # swap stops the service rather than degrading it.
+    admitted = {}
+    try:
+        for role, path in (("approver", args.approvers), ("requester", args.requesters)):
+            principals, status, detail = admit_registry(args.ledger, role, path)
+            admitted[role] = (parse_registry(principals, role), status, detail)
+    except registry.RegistryError as exc:
+        print(f"\nRefusing to start: {exc}", file=sys.stderr)
+        sys.exit(3)
+
     STATE["service"] = disclosure.DisclosureService(
         sealing.RecordOpener(private_hex),
         bytes.fromhex(args.index_key),
-        load_approvers(args.approvers),
+        admitted["approver"][0],
         usage=STATE["usage"],
         max_disclosures=args.max_disclosures,
-        requester_registry=load_registry(args.requesters, "requester"),
+        requester_registry=admitted["requester"][0],
         presence_mode=args.presence_mode)
     if args.presence_mode == "required" and not args.requesters:
         parser.error("--presence-mode required needs --requesters: with no enrolled "
@@ -436,6 +487,10 @@ def main():
     opener = STATE["service"]._opener
     hardware = sorted(name for name, entry in STATE["service"].requesters.items()
                       if entry.get("webauthn"))
+    for role, (_, status, detail) in admitted.items():
+        if status != "unchanged":
+            # A change in whose keys count is an event, not a startup detail.
+            record(f"registry_{status}", "disclosure-service", dict(detail, role=role))
     record("service_started", "disclosure-service", {
         "key_id": opener.key_id, "approvers": sorted(STATE["service"].approvers),
         "max_disclosures": STATE["service"].max_disclosures,
@@ -452,6 +507,9 @@ def main():
     print(f"  presence   : {args.presence_mode} "
           f"({len(STATE['service'].requesters)} requester(s) enrolled, "
           f"{len(hardware)} on hardware)")
+    for role, (_, status, detail) in admitted.items():
+        print(f"  {role + ' reg':<11}: v{detail['version']} "
+              f"({detail['principals']} enrolled, {status})")
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()

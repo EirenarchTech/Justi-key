@@ -120,6 +120,61 @@ class TestRefusals(WebAuthnTest):
                 self.verify(broken)
 
 
+class TestUserPresenceIsNotOptional(WebAuthnTest):
+    """UP has no off switch, at any layer, for any role.
+
+    An assertion the authenticator produced with nobody touching it is not
+    evidence a human did anything, so every claim built on top of it would be
+    false. This is pinned as an invariant rather than left to a default.
+    """
+
+    def test_no_argument_relaxes_user_presence(self):
+        absent = self.token.assert_challenge(self.challenge, user_present=False)
+        for kwargs in ({}, {"require_user_verification": False},
+                       {"require_user_verification": True}):
+            with self.assertRaises(webauthn.WebAuthnError) as caught:
+                self.verify(absent, **kwargs)
+            self.assertIn("present user", str(caught.exception))
+
+    def test_verify_assertion_has_no_user_presence_parameter(self):
+        import inspect
+        parameters = inspect.signature(webauthn.verify_assertion).parameters
+        self.assertNotIn("require_user_presence", parameters)
+        self.assertIn("require_user_verification", parameters)
+
+
+class TestPerRoleUserVerification(unittest.TestCase):
+    """Which roles must clear the stronger bar is a deployment decision."""
+
+    def setUp(self):
+        from justikey import config
+        self.config = config
+        self._saved = config.WEBAUTHN_REQUIRE_UV_ROLES
+        self.addCleanup(setattr, config, "WEBAUTHN_REQUIRE_UV_ROLES", self._saved)
+
+    def set_roles(self, value):
+        self.config.WEBAUTHN_REQUIRE_UV_ROLES = tuple(
+            part.strip().lower() for part in value.split(",") if part.strip())
+
+    def test_all_requires_every_role(self):
+        self.set_roles("all")
+        for role in ("requester", "approver", "auditor"):
+            self.assertTrue(self.config.require_user_verification(role))
+
+    def test_none_requires_no_role(self):
+        self.set_roles("none")
+        self.assertFalse(self.config.require_user_verification("approver"))
+
+    def test_a_named_role_is_required_and_others_are_not(self):
+        self.set_roles("approver")
+        self.assertTrue(self.config.require_user_verification("approver"))
+        self.assertFalse(self.config.require_user_verification("requester"))
+
+    def test_the_default_requires_every_role(self):
+        """A weaker default would make the stronger claim the exception."""
+        self.assertEqual(self._saved, ("all",))
+
+
 @unittest.skipIf(SKIP, "WebAuthn verification requires the cryptography package")
 class TestCoseDecoding(unittest.TestCase):
     def test_a_truncated_key(self):

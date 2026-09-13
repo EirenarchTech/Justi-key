@@ -227,6 +227,88 @@ class TestProofBinding(PresenceTest):
         self.assertEqual(service.last_use_count, 2)      # not 7
 
 
+class TestConcurrentSpend(PresenceTest):
+    """Two requests racing must not both get through.
+
+    One service object shared across threads, exactly as the server holds it;
+    UsageStore opens its own connection per claim, which is the part that has
+    to be thread-safe.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.enrol_software()
+        self.statement, self.signature = self.statement_for()
+        self.rows = self.rows_for(self.statement)
+        self.service = disclosure.service_for(self.conn, self.path)
+
+    def race(self, proofs):
+        """`proofs` is built on this thread: the test's own connection is not
+        shared with the workers, only the service object is."""
+        import threading
+        threads = len(proofs)
+        succeeded, unexpected = [], []
+        barrier, lock = threading.Barrier(threads), threading.Lock()
+
+        def attempt(index):
+            proof_statement, proof = proofs[index]
+            barrier.wait()
+            try:
+                self.service.disclose(self.rows, self.statement, self.signature,
+                                      "officer1", proof_statement, proof)
+            except disclosure.DisclosureError:
+                return
+            except Exception as exc:                       # noqa: BLE001
+                with lock:
+                    unexpected.append(f"{type(exc).__name__}: {exc}")
+                return
+            with lock:
+                succeeded.append(index)
+
+        workers = [threading.Thread(target=attempt, args=(i,)) for i in range(threads)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        self.assertEqual(unexpected, [])
+        return succeeded
+
+    def fresh_proofs(self, count):
+        return [self.software_proof(self.statement) for _ in range(count)]
+
+    def test_one_proof_of_presence_survives_exactly_one_of_sixteen_requests(self):
+        """The uniqueness constraint on presence_nonces.nonce is the backstop."""
+        one = self.software_proof(self.statement)
+        self.assertEqual(len(self.race([one] * 16)), 1)
+
+    def test_concurrent_requests_cannot_exceed_the_remaining_budget(self):
+        self.service.max_disclosures = 4
+        self.assertEqual(len(self.race(self.fresh_proofs(16))), 4)
+
+    def test_a_request_refused_by_the_cap_does_not_burn_a_confirmation(self):
+        """Both spends commit together or not at all: being refused by the cap
+        must not also cost the requester their confirmation."""
+        self.service.max_disclosures = 2
+        self.race(self.fresh_proofs(8))
+        spent = self.conn.execute(
+            "SELECT COUNT(*) c FROM presence_nonces").fetchone()["c"]
+        self.assertEqual(spent, 2)
+
+    def test_a_failed_presence_spend_does_not_advance_the_disclosure_count(self):
+        proof_statement, proof = self.software_proof(self.statement)
+        self.service.disclose(self.rows, self.statement, self.signature,
+                              "officer1", proof_statement, proof)
+        first = self.service.last_use_count
+        for _ in range(3):
+            with self.assertRaises(disclosure.DisclosureError):
+                self.service.disclose(self.rows, self.statement, self.signature,
+                                      "officer1", proof_statement, proof)
+        again_statement, again_proof = self.software_proof(self.statement)
+        self.service.disclose(self.rows, self.statement, self.signature,
+                              "officer1", again_statement, again_proof)
+        self.assertEqual(self.service.last_use_count, first + 1)
+
+
 class TestHardwareCustody(PresenceTest):
     def test_a_touched_security_key_opens_records(self):
         token = self.enrol_hardware()

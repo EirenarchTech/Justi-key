@@ -218,6 +218,20 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
 );
 CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user ON webauthn_credentials(user_id);
 
+-- WebAuthn signature counters, owned by the verifying side.
+--
+-- Deliberately NOT kept in the registry file: that file is declarative
+-- configuration whose digest is committed to the ledger, and a counter
+-- advancing on every use would make routine activity indistinguishable from
+-- someone changing whose keys count. Keeping it here also means re-exporting
+-- a registry cannot silently reset a counter to zero, which would disarm the
+-- cloned-authenticator check.
+CREATE TABLE IF NOT EXISTS webauthn_counters (
+    credential_id TEXT PRIMARY KEY,
+    sign_count INTEGER NOT NULL,
+    last_used_at TEXT NOT NULL
+);
+
 -- Proofs of presence, spendable once each. Separate from approval nonces:
 -- an approval may be spent N times, but each human confirmation authorizes
 -- exactly one of those.

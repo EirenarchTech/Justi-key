@@ -205,6 +205,21 @@ signature, there is no key, so there is no plaintext.
    flags, and the signature counter — each a distinct attack, each a distinct
    refusal.
 
+   Four invariants this stage commits to, each pinned by a test rather than
+   left to a default: user presence is mandatory for every hardware assertion
+   with no way to disable it; user verification is required per role
+   (`JUSTIKEY_WEBAUTHN_REQUIRE_UV`, defaulting to all); the approval count and
+   the presence nonce are spent in **one** transaction with a uniqueness
+   constraint as the backstop, so concurrent requests cannot both get through
+   and a request refused by the cap does not also burn a confirmation; and the
+   registries are versioned with their digests committed to the service's
+   ledger, so a rollback or a silent swap refuses to start it.
+
+   An assertion proves the enrolled authenticator participated, that a user
+   was present, and — under UV — that the operator authenticated to the
+   authenticator. It does **not** prove the person understood the
+   transaction; that needs a trusted display, which no commodity key has.
+
    **What is not built:** the browser pages that run the WebAuthn
    registration and assertion ceremonies. Verification and enrolment are
    complete and tested against a synthetic authenticator
