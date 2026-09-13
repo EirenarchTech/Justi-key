@@ -6,7 +6,21 @@ request: ownership, approval state, expiration, exact target-plate match,
 and the authorized date/time window. If any condition fails, disclosure
 is denied and the reason is returned so the caller can audit it.
 """
-from . import approvals, config, disclosure, models, sealing, timeutil
+import threading
+
+from . import (approvals, config, custody, disclosure, models, presence,
+               sealing, timeutil)
+
+# What the most recent disclosure on this thread proved about the requester.
+# Kept per-thread because the server handles requests concurrently and an
+# audit entry attributing one officer's security key to another's search
+# would be worse than recording nothing.
+_LOCAL = threading.local()
+
+
+def last_presence_custody():
+    """'hardware', 'software', or 'none' for the disclosure just evaluated."""
+    return getattr(_LOCAL, "presence", "none")
 
 DENIAL_MESSAGES = {
     "authorization_not_found": "No such authorization exists.",
@@ -23,6 +37,13 @@ DENIAL_MESSAGES = {
                           "approval could not be verified against the request.",
     "disclosure_unavailable": "The disclosure service is unavailable, so these records cannot "
                               "be opened. Records stay sealed; no partial disclosure occurs.",
+    "presence_required": "This disclosure needs proof that you are present: confirm with your "
+                         "password, or your security key if you have one enrolled. An approval "
+                         "on its own is not enough to open records.",
+    "presence_invalid": "Your proof of presence could not be verified, so no records were "
+                        "opened.",
+    "presence_unavailable": "You have no signing key enrolled, and this deployment requires "
+                            "every disclosure to carry proof that the requester is present.",
 }
 
 
@@ -44,8 +65,16 @@ def check_window_breadth(window_start, window_end, max_days=None):
     return (window_days(window_start, window_end) <= max_days), max_days
 
 
-def evaluate_disclosure(conn, auth_id, requested_plate, actor_user):
-    """Return (allowed: bool, reason: str|None, events: list)."""
+def evaluate_disclosure(conn, auth_id, requested_plate, actor_user,
+                        presence_key=None, presence_proof=None):
+    """Return (allowed: bool, reason: str|None, events: list).
+
+    `presence_key` is the requester's unwrapped signing key, supplied only
+    for the moment of this request. `presence_proof` is a callable taking the
+    built proof statement and returning a proof envelope, which is how a
+    hardware authenticator participates: the assertion is produced outside
+    this process and handed back.
+    """
     auth_row = models.get_authorization(conn, auth_id)
     if auth_row is None:
         return False, "authorization_not_found", []
@@ -116,9 +145,34 @@ def evaluate_disclosure(conn, auth_id, requested_plate, actor_user):
         auth_row, actor_user["username"], approver["username"],
         auth_row["approved_at"], auth_row["approval_expires_at"],
         approver_key_id=sealing.key_id(approver["signing_pub"]))
+    # Proof of presence. An approval is a bearer capability until the person
+    # it belongs to shows up for this specific request, so the proof is built
+    # over the statement that was actually signed and nothing else.
+    proof_statement, proof = None, None
+    _LOCAL.presence = "none"
+    try:
+        credential = models.presence_credential(conn, actor_user)
+    except custody.CustodyError:
+        credential = None
+    if config.PRESENCE_MODE != "off":
+        if credential is None:
+            if config.PRESENCE_MODE == "required":
+                return False, "presence_unavailable", []
+        elif presence_key is None and presence_proof is None:
+            return False, "presence_required", []
+        else:
+            proof_statement = presence.build(
+                statement, custody.credential_key_id(credential))
+            try:
+                proof = (presence_proof(proof_statement) if presence_proof is not None
+                         else presence.sign(presence_key, proof_statement))
+            except (custody.CustodyError, presence.PresenceError, ValueError, TypeError):
+                return False, "presence_invalid", []
+            _LOCAL.presence = "hardware" if custody.is_hardware(credential) else "software"
+
     try:
         opened = service.disclose(candidates, statement, auth_row["approval_signature"],
-                                  actor_user["username"])
+                                  actor_user["username"], proof_statement, proof)
     except (disclosure.DisclosureError, sealing.SealingError):
         return False, "disclosure_refused", []
 

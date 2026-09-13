@@ -200,6 +200,34 @@ CREATE INDEX IF NOT EXISTS idx_authorization_usage_expiry ON authorization_usage
 -- Transport nonces for application-to-service requests, separate from
 -- approval nonces: without these, an authenticated request that was captured
 -- can be resent inside the clock-skew window.
+-- Hardware authenticators. The public key is a base64url COSE key; the
+-- private half never existed on this host, which is the entire point.
+-- sign_count is persisted so a cloned authenticator shows up as a counter
+-- that failed to advance.
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+    credential_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    public_key TEXT NOT NULL,
+    sign_count INTEGER NOT NULL DEFAULT 0,
+    label TEXT NOT NULL,
+    rp_id TEXT,
+    origin TEXT,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user ON webauthn_credentials(user_id);
+
+-- Proofs of presence, spendable once each. Separate from approval nonces:
+-- an approval may be spent N times, but each human confirmation authorizes
+-- exactly one of those.
+CREATE TABLE IF NOT EXISTS presence_nonces (
+    nonce TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL,
+    used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_presence_nonces_expiry ON presence_nonces(expires_at);
+
 CREATE TABLE IF NOT EXISTS transport_nonces (
     nonce TEXT PRIMARY KEY,
     seen_at TEXT NOT NULL

@@ -577,6 +577,68 @@ def issue_source_credential(conn, source_id, label="default"):
     return key
 
 
+# ---------------------------------------------------------------------------
+# Hardware authenticators (stage 4)
+# ---------------------------------------------------------------------------
+
+def enrol_webauthn_credential(conn, user_id, credential_id, public_key, label,
+                              rp_id=None, origin=None, sign_count=0):
+    """Record a hardware authenticator for a user.
+
+    Only the public half is stored, because only the public half exists
+    outside the token. Once a user has one of these, custody.verify_proof
+    refuses their software signatures -- enrolling hardware is meant to raise
+    the bar, not add an alternative to it.
+    """
+    conn.execute(
+        "INSERT INTO webauthn_credentials (credential_id, user_id, public_key, "
+        "sign_count, label, rp_id, origin, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (credential_id, user_id, public_key, sign_count, label, rp_id, origin,
+         timeutil.now_iso()))
+    return credential_id
+
+
+def webauthn_credentials_for(conn, user_id, include_revoked=False):
+    clause = "" if include_revoked else " AND revoked_at IS NULL"
+    return conn.execute(
+        "SELECT * FROM webauthn_credentials WHERE user_id=?" + clause +
+        " ORDER BY created_at ASC", (user_id,)).fetchall()
+
+
+def revoke_webauthn_credential(conn, credential_id):
+    conn.execute("UPDATE webauthn_credentials SET revoked_at=? WHERE credential_id=?",
+                 (timeutil.now_iso(), credential_id))
+
+
+def record_webauthn_use(conn, credential_id, sign_count):
+    """Persist the counter. Forgetting this is how counter checks rot."""
+    conn.execute(
+        "UPDATE webauthn_credentials SET sign_count=?, last_used_at=? WHERE credential_id=?",
+        (sign_count, timeutil.now_iso(), credential_id))
+
+
+def presence_credential(conn, user):
+    """The credential this user must prove presence with, or None.
+
+    Mirrors what the disclosure service's registry would resolve for them, so
+    the proof is built naming the same key the verifier will expect. A live
+    hardware authenticator wins over the software key.
+    """
+    from . import custody
+    if not user["signing_pub"]:
+        return None
+    entry = {"public_key": user["signing_pub"],
+             "revoked": bool(user["signing_key_revoked_at"])}
+    hardware = conn.execute(
+        "SELECT credential_id, public_key, sign_count, rp_id, origin "
+        "FROM webauthn_credentials WHERE user_id=? AND revoked_at IS NULL "
+        "ORDER BY created_at ASC LIMIT 1", (user["id"],)).fetchone()
+    if hardware is not None:
+        entry["webauthn"] = dict(hardware)
+    return custody.credential_from_registry(
+        entry, rp_id=config.WEBAUTHN_RP_ID, origin=config.WEBAUTHN_ORIGIN)
+
+
 # --- Signed ingest -----------------------------------------------------------
 
 def signing_secrets_for(conn, source):

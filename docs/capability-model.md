@@ -68,6 +68,8 @@ gains the ability to decrypt anything else.
 | Malicious/compromised app server | **reads everything** | reads nothing without an approver signature |
 | Administrator on the app host | **reads everything** | reads nothing without an approver signature |
 | Insider with a valid login | blocked by policy checks | blocked, and cryptographically so |
+| Compromised app replaying a live approval | **reads that plate's history** | refused without fresh proof the requester is present (stage 4) |
+| Compromised app that captured a password | **signs as that person** | refused once they hold a security key (stage 4) |
 | Compromised disclosure service | n/a | reads everything — the new concentration of risk |
 
 The two-person rule stops being a procedural control the application chooses
@@ -170,8 +172,51 @@ signature, there is no key, so there is no plaintext.
    and the archive cannot be repaired, because repairing it would mean opening
    records the application can no longer open.
 
-4. **Hardware custody.** Approver keys on smartcards; disclosure key in an
-   HSM or KMS that enforces the policy check itself.
+4. **Hardware custody and proof of presence.** *(built — `justikey/webauthn.py`,
+   `justikey/custody.py`, `justikey/presence.py`)*
+   Stage 3 leaves an approval a **bearer capability**: the disclosure service
+   checks that it is genuine, unexpired, in scope and within its count, and
+   all of that is equally true of a request a compromised application sends
+   on its own, using an approval from its own database and the string
+   `requester="officer1"`. Nothing proved the officer was there.
+
+   Now the requester signs each disclosure as they ask for it — not the
+   authorization, which was the approver's signature made earlier, but *this
+   request*: which approval, over which exact signed scope, by whom, once,
+   now. The service verifies it against a requester registry it holds and the
+   application does not, spends the proof's nonce so one confirmation buys
+   one disclosure, and caps the lifetime a proof may claim for itself.
+
+   Keys move off the host through one proof envelope covering both custodies:
+
+       {"alg": "ed25519",  "sig": ...}                    software, password-wrapped
+       {"alg": "webauthn", "authenticator_data": ..., ...} hardware, key never exported
+
+   `custody.verify_proof` dispatches on that field, so a deployment migrates
+   one person at a time without a second verification path — and a principal
+   with hardware enrolled has their software signature **refused**, because
+   enrolling a security key must raise the bar rather than add a second way
+   in that the old password still opens.
+
+   The challenge a WebAuthn authenticator signs is the digest of the exact
+   statement being authorized, so an assertion is usable for that statement
+   and no other. Verification checks the signature, the ceremony type, the
+   challenge, the origin, the RP id, the user-present and user-verified
+   flags, and the signature counter — each a distinct attack, each a distinct
+   refusal.
+
+   **What is not built:** the browser pages that run the WebAuthn
+   registration and assertion ceremonies. Verification and enrolment are
+   complete and tested against a synthetic authenticator
+   (`tests/authenticator.py`); `scripts/manage_keys.py` enrols a credential
+   from registration values obtained by any means. The disclosure key in an
+   HSM or KMS that enforces the scope check itself also remains ahead.
+
+Each stage closed a hole the previous one made visible: stage 2's split made
+it obvious the application still held the index key, stage 3's chokepoint
+made it obvious the disclosure cap lived in the untrusted side, and stage 3
+finished made it obvious an approval was a bearer token. The remaining one is
+stated in threat-model finding 5.
 
 Stage 1 is worth doing on its own merits and is a prerequisite for the rest.
 `scripts/capability_poc.py` demonstrates stages 2–3 end to end so the design

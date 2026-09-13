@@ -69,7 +69,8 @@ SQL, code execution — the following hold and are tested:
 | Forge an approval with an attacker-controlled key | refused: the service holds its own approver registry |
 | Grind the index through `/index` | possible, rate limited, logged (finding 1) |
 | Replay a captured authenticated request | refused: transport nonces are spent once |
-| Reuse a genuine live approval at `/disclose` | possible within its scope, window and remaining count; capped and logged by the service (finding 5) |
+| Reuse a genuine live approval at `/disclose` | refused without fresh proof the requester is present (finding 5); where no requester key is enrolled, possible within scope, window and count, capped and logged |
+| Sign as a requester whose password it captured | refused once that requester holds a security key |
 
 The precise claim this supports is: **the application cannot decrypt stored
 observations after ingestion.** It is *not* "the application never has access
@@ -89,8 +90,11 @@ the key it has enrolled.
 The approver's key is wrapped under their password, so the application can
 sign only while an approver is actually present. It cannot mint approvals for
 last month or for tomorrow. **Residual:** an application compromised at the
-moment of signing can misuse that moment. Stage 4 (smartcard / WebAuthn)
-closes it.
+moment of signing can misuse that moment — and, having seen the password, can
+keep signing afterwards. An approver enrolled on a WebAuthn authenticator
+(`justikey/custody.py`) closes the second half of that: the key never reaches
+this process, so the attacker gets the operations a present human confirmed
+and nothing more.
 
 ## 5. Active authorization abuse — the residual inside a valid approval
 
@@ -131,13 +135,50 @@ captured one could be resent verbatim. Each `X-JustiKey-Nonce` is now spent
 once, in a separate namespace from approval nonces, and reuse is a 401 and a
 `transport_replay_refused` ledger entry.
 
-**What is still open.** Within a live approval's scope, window and remaining
-count, a compromised application can obtain the plates that approval covers,
-attributed to the requester who is not there. Narrowing it further needs a
-requester-held key: proof-of-presence at disclosure time, not only at
-approval time, so the service can tell an officer's request from the
-application's imitation of one. That is stage 4, and it is the reason short
-expiries and small caps are not cosmetic settings.
+### What stage 4 changed
+
+The bounds above were real; the absent officer was too. A fifth bound now
+sits ahead of all of them: the requester signs each disclosure at the moment
+they ask for it (`justikey/presence.py`), and the service checks it against a
+requester registry it holds and the application does not.
+
+| Bound | Where it is enforced |
+|---|---|
+| Presence: this person, this approval, this scope, once, now | service, against its own requester registry |
+
+The proof carries the approval's nonce and the digest of the approver's exact
+signed statement, so it cannot be moved onto a different approval or onto one
+whose row was edited afterwards; its nonce is spent once, so one confirmation
+buys one disclosure; and the lifetime it may claim for itself is capped by the
+verifier, not by the caller. Measured against the same attack: with no key
+enrolled, replaying a stored approval opened the record; with a key enrolled,
+`this disclosure needs proof that the requester is present; an approval on
+its own is not sufficient`.
+
+**What is still open, and how far.** It depends on where the requester's key
+lives, and the difference is the whole reason stage 4 has two halves:
+
+| Requester's key | What a fully compromised application can still do |
+|---|---|
+| None enrolled (`presence_mode: enrolled`) | everything above: spend live approvals in that person's name |
+| Software, password-wrapped | mint further proofs *while it holds the unwrapped key* — i.e. during moments the officer is actually present and working, and not afterwards |
+| Hardware (WebAuthn) | obtain a proof only for a challenge a present human physically confirmed, one touch at a time, and none afterwards |
+
+So the honest claim is no longer "an approval is a bearer capability". It is:
+**a live approval plus a present requester is a bearer capability for that
+moment**, and with hardware custody, for that single confirmed operation. A
+compromised application that captured an officer's password gets nothing once
+they hold a security key — `custody.verify_proof` refuses a software
+signature from a principal with hardware enrolled, so enrolling a key raises
+the bar rather than adding a second way in.
+
+What remains beyond this is not about the requester. The disclosure service
+still holds its private key in process memory (finding 2): an HSM or KMS that
+performs the key agreement itself, and re-checks scope before doing so, is
+the next concentration of risk to break up. And the browser pages that run
+the WebAuthn ceremonies are not written, so hardware custody today requires
+obtaining registration values by other means — the verification path is
+complete and tested, the front door to it is not.
 
 ## 6. Record transplantation
 

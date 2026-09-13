@@ -120,6 +120,7 @@ scripts/
   encrypt_store.py  migrate a plaintext database to encryption at rest
   enforce_retention.py delete observations past their retention period
   seal_store.py     the v1 -> v3 migration ceremony, step by step
+  manage_keys.py    enrol hardware authenticators; export the service registries
   disclosure_server.py the disclosure service, as its own process and principal
   verify_audit.py   independent verifier: chain + anchors + witness
 
@@ -431,6 +432,106 @@ than producing a store that verifies clean and can never be searched again.
 Standing up the service is not an optional hardening step here; it is what
 makes the last two steps possible.
 
+## Proof of presence: an approval is not a bearer token
+
+Through stage 3 the disclosure service checks that an approval is genuine,
+unexpired, in scope and within its count. Every one of those is equally true
+of a request a **compromised application** sends on its own, using an
+approval lifted from its own database and the string `requester="officer1"`.
+The scope bounds held. Nothing proved the officer was there.
+
+So the requester now signs each disclosure at the moment they ask for it —
+not the authorization, which was the approver's signature made earlier, but
+*this request*:
+
+```
+{"v", "approval_nonce", "statement_digest", "requester", "requester_key_id",
+ "request_nonce", "issued_at", "expires_at"}
+```
+
+Every field carries weight. `approval_nonce` and `statement_digest` bind the
+proof to one approval and to the exact scope the approver signed, so it
+cannot be moved onto another approval or onto one whose row was edited after
+signing. `request_nonce` is spent once by the service, so one confirmation
+buys one disclosure. The lifetime is capped by the verifier rather than
+claimed by the caller — otherwise a compromised application would simply
+issue itself one good for a year.
+
+Measured against the attack it exists to stop:
+
+```
+no requester key enrolled : approval replayed with nobody present -> OPENED
+key enrolled              : refused - this disclosure needs proof that the
+                            requester is present; an approval on its own is
+                            not sufficient
+requester actually present: OPENED (custody: software)
+that proof replayed       : refused - already been used
+that proof on another approval: refused - made for a different approval
+```
+
+### Hardware custody
+
+A password-wrapped key has a fixed ceiling: it passes through this process,
+so an attacker already inside gets it at that moment — and keeps it. A
+WebAuthn authenticator never exports its private key, so the attacker gets
+only the operations a present human physically confirmed, and none
+afterwards.
+
+Both are the same proof envelope, so there is one verification path rather
+than two sets of bugs:
+
+```
+{"alg": "ed25519",  "sig": "<hex>"}                         software
+{"alg": "webauthn", "authenticator_data": ..., ...}         hardware
+```
+
+The challenge the authenticator signs is the **digest of the exact statement
+being authorized**, so an assertion is good for that statement and no other.
+Verification (`justikey/webauthn.py`) checks the signature, the ceremony
+type, the challenge, the origin, the RP id, the user-present and
+user-verified flags, and the signature counter — each a separate attack, each
+a separate refusal. COSE keys are decoded in-module for ES256 and Ed25519
+rather than through a CBOR dependency that would parse attacker-supplied
+input.
+
+Enrolling hardware **raises** the bar rather than adding to it:
+
+```
+attacker knows the password and forges a software proof:
+  refused - this principal is enrolled with a hardware authenticator,
+            so a software signature is not accepted
+```
+
+```bash
+python3 scripts/manage_keys.py list --db justikey.db
+python3 scripts/manage_keys.py enrol --db justikey.db --user officer1 \
+    --credential-id <base64url> --public-key <base64url COSE> --label "YubiKey 5"
+python3 scripts/manage_keys.py export --db justikey.db \
+    --approvers approvers.json --requesters requesters.json
+```
+
+The service reads those registries on its own host and never asks the
+application, which is what stops a compromised application choosing whose
+keys count:
+
+```bash
+python3 scripts/disclosure_server.py --port 8090 ... \
+    --approvers approvers.json --requesters requesters.json \
+    --presence-mode required
+```
+
+`--presence-mode enrolled` (the default) requires a proof from every
+requester who has a key, so a deployment can enrol people gradually;
+`required` refuses any disclosure without one.
+
+**Not built:** the browser pages that run the WebAuthn registration and
+assertion ceremonies. Verification and enrolment are complete and tested
+against a synthetic authenticator (`tests/authenticator.py`) that produces
+byte-exact assertions; what is missing is the front door to them. The web
+interface today collects the requester's password and signs with their
+software key. See [threat-model.md](docs/threat-model.md) finding 5 for
+exactly how far each custody gets you.
+
 ## Limits enforced in software, not policy
 
 The stated goal is to turn privacy requirements into enforceable
@@ -440,6 +541,8 @@ architecture. These were previously human expectations only:
 |---|---|---|
 | Maximum authorization time window | `JUSTIKEY_MAX_WINDOW_DAYS` | 90 days |
 | Disclosures per approval | `JUSTIKEY_MAX_DISCLOSURES` / `--max-disclosures` | 25 |
+| Proof-of-presence mode | `JUSTIKEY_PRESENCE_MODE` / `--presence-mode` | enrolled |
+| Proof-of-presence lifetime | `JUSTIKEY_PRESENCE_TTL` | 120s |
 | Failed sign-ins before lockout | `JUSTIKEY_MAX_FAILED_LOGINS` | 5 |
 | Lockout duration | `JUSTIKEY_LOCKOUT_SECONDS` | 900 |
 | Observation retention | `JUSTIKEY_RETENTION_DAYS` | 365 days |
@@ -817,13 +920,15 @@ residuals that survive every control here.
 
 **Not implemented, and needed before real plate data:**
 
-- **Hardware key custody.** Approver keys are wrapped under a password and
-  the disclosure key is a file. Stage 4 puts approver keys on smartcards or
-  WebAuthn and the disclosure key in an HSM. Until then, an application
-  compromised *at the moment an approver signs* can misuse that moment.
-- **Requester proof-of-presence at disclosure.** A live approval is a bearer
-  capability: a compromised application can spend it in the requester's name
-  within its scope, window and remaining count. See threat-model finding 5.
+- **The WebAuthn browser ceremonies.** Assertion verification, the custody
+  layer and credential enrolment are built and tested; the registration and
+  assertion pages that would let a user enrol and use a security key through
+  the web interface are not. Hardware custody works today only for a
+  deployment that obtains the registration values by other means.
+- **The disclosure key in hardware.** It is a file the service reads into
+  memory. An HSM or KMS that performs the key agreement itself, and re-checks
+  scope before doing so, is the next concentration of risk to break up
+  (threat-model finding 2).
 - **mTLS or device-identity authentication for sensor ingest.** Sensors
   authenticate with per-source bearer or HMAC credentials, not device
   identity.
@@ -842,6 +947,11 @@ residuals that survive every control here.
   opportunistically at login; `used_totp` rows accumulate.
 
 **Implemented, but read the caveat:**
+
+- **Proof of presence.** The requester signs each disclosure, so a stored
+  approval is no longer enough on its own. With a software key the attacker's
+  window narrows to moments the requester is actually working rather than
+  closing entirely; with hardware it closes.
 
 - **Keys outside the database.** Data, index, anchor and disclosure keys can
   all be supplied from a secrets manager, and under v3 the disclosure and

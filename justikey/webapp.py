@@ -743,6 +743,23 @@ def search_form(h):
         f'(expires {templates.escape(r["approval_expires_at"][:19])})</option>'
         for r in active
     )
+    # Proof of presence. An approval is a bearer capability until its owner
+    # shows up for the specific request, so the password is collected here and
+    # used to sign this disclosure -- not merely to prove you are logged in.
+    presence_field = ""
+    if config.PRESENCE_MODE != "off" and user["signing_pub"]:
+        hardware = models.webauthn_credentials_for(h.conn, user["id"])
+        if hardware:
+            presence_field = (
+                '<p class="hint">This account uses a security key. Confirm the search on '
+                'your authenticator; a password will not open records for you.</p>')
+        else:
+            presence_field = (
+                '<label>Your password <span class="hint">(signs this search, so a stolen '
+                'approval cannot be used without you)</span></label>'
+                '<input type="password" name="presence_password" '
+                'autocomplete="current-password" required>')
+
     body = f"""
 <div class="card" style="max-width:560px;">
 <h2>Authorized search</h2>
@@ -754,6 +771,7 @@ while that approval remains valid.</p>
 <select name="authorization_id" required>{options}</select>
 <label>Plate to search</label>
 <input type="text" name="plate" required placeholder="ABC123">
+{presence_field}
 <button type="submit">Search</button>
 </form>
 </div>
@@ -773,7 +791,19 @@ def search_submit(h):
     except ValueError:
         raise HttpError(400, "Invalid authorization.")
 
-    allowed, reason, events = policy.evaluate_disclosure(h.conn, auth_id, plate, user)
+    presence_key = None
+    if config.PRESENCE_MODE != "off" and user["signing_pub"]:
+        password = form.get("presence_password") or ""
+        if password:
+            try:
+                presence_key = approvals.unwrap_signing_key(user, password)
+            except approvals.ApprovalKeyError:
+                audit.append_event(h.conn, "presence_unlock_failed", user["username"],
+                                   {"authorization_id": auth_id})
+                raise HttpError(403, "Your signing key could not be unlocked.")
+
+    allowed, reason, events = policy.evaluate_disclosure(
+        h.conn, auth_id, plate, user, presence_key=presence_key)
 
     if not allowed:
         audit.append_event(h.conn, "search_denied", user["username"], {
@@ -789,6 +819,10 @@ def search_submit(h):
     audit.append_event(h.conn, "disclosure", user["username"], {
         "authorization_id": auth_id, "target_plate": plate.strip().upper(),
         "record_count": len(events), "disclosures_used": used,
+        # "a password was typed" and "a security key was touched" are
+        # different events, and the ledger should not call them both
+        # "disclosure" with nothing to tell them apart.
+        "presence": policy.last_presence_custody(),
     })
     trs = "".join(f"""<tr>
 <td>{templates.escape(e['captured_at'][:19])}</td>

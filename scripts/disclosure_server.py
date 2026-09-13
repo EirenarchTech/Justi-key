@@ -33,6 +33,14 @@ application. The service keeps `approval nonce -> disclosure count -> expiry`
 in its own ledger database and updates it atomically before opening anything,
 so attempt 26 is refused whatever the caller claims about the first 25.
 
+PROOF OF PRESENCE
+
+An approval alone is a bearer capability: whoever holds the row can spend it
+in the requester's name. With --requesters, the service also demands a
+freshly signed proof that the requester is here for this specific disclosure,
+checked against a key this service holds and the application does not. See
+justikey/presence.py.
+
 APPROVER ENROLMENT
 
 Approver public keys live here, in --approvers, not in the request. A
@@ -85,6 +93,15 @@ CREATE TABLE IF NOT EXISTS authorization_usage (
     last_used_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_authorization_usage_expiry ON authorization_usage(expires_at);
+
+-- Proofs that the requester was present, spendable once each. An approval
+-- may be used N times, but each human confirmation authorizes one of them.
+CREATE TABLE IF NOT EXISTS presence_nonces (
+    nonce TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL,
+    used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_presence_nonces_expiry ON presence_nonces(expires_at);
 
 -- Transport nonces, spent once each, so a captured authenticated request
 -- cannot simply be resent inside the clock-skew window.
@@ -245,12 +262,15 @@ class Handler(BaseHTTPRequestHandler):
         statement = payload.get("statement")
         signature = payload.get("signature")
         requester = payload.get("requester")
+        proof_statement = payload.get("presence")
+        proof = payload.get("presence_proof")
         if not isinstance(rows, list) or len(rows) > disclosure.MAX_ROWS_PER_REQUEST:
             self._json(400, {"error": "invalid or oversized candidate set"})
             return
 
         try:
-            opened = STATE["service"].disclose(rows, statement, signature, requester)
+            opened = STATE["service"].disclose(rows, statement, signature, requester,
+                                               proof_statement, proof)
         except disclosure.DisclosureError as exc:
             record("disclosure_refused", f"requester:{requester}", {
                 "reason": str(exc),
@@ -264,6 +284,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(409, {"error": str(exc)})
             return
 
+        # Persist the authenticator's counter. A verifier that checks the
+        # counter but never stores the new value is checking nothing.
+        proved = STATE["service"].last_presence or {}
+        if proved.get("custody") == "hardware":
+            entry = STATE["service"].requesters.get(requester, {}).get("webauthn")
+            if entry is not None:
+                entry["sign_count"] = proved["sign_count"]
+                save_requesters()
+
         # Recorded before the response is written: an opening that reached the
         # caller but not the ledger would be exactly the gap that matters.
         record("disclosure_granted", f"requester:{requester}", {
@@ -272,11 +301,33 @@ class Handler(BaseHTTPRequestHandler):
             "approver": statement.get("approver"),
             "use_count": STATE["service"].last_use_count,
             "use_limit": STATE["service"].max_disclosures,
+            # Which custody the requester proved presence with. "software" and
+            # "hardware" are materially different events and the ledger says
+            # which, rather than recording both as "disclosed".
+            "presence": (STATE["service"].last_presence or {}).get("custody", "none"),
             "candidates": len(rows), "opened": len(opened)})
         self._json(200, {"opened": opened})
 
 
-def load_approvers(path):
+def load_registry(path, role):
+    """Enrolled keys for one role, read from this service's own file.
+
+    Two files, two roles. A single list with a role field would put the
+    distinction inside a value someone can edit; separate files make
+    "approver" and "requester" a property of where the key is written down.
+
+    An entry is either a software key:
+
+        {"alice": {"public_key": "<hex>", "revoked": false}}
+
+    or a hardware authenticator, whose private half has never existed on any
+    host here:
+
+        {"alice": {"public_key": "<hex>", "webauthn": {
+            "credential_id": "...", "public_key": "<base64url COSE>",
+            "sign_count": 0, "rp_id": "justikey.example", 
+            "origin": "https://justikey.example"}}}
+    """
     if not path:
         return {}
     with open(path, "r") as fh:
@@ -284,10 +335,39 @@ def load_approvers(path):
     registry = {}
     for username, entry in data.items():
         if not isinstance(entry, dict) or "public_key" not in entry:
-            raise ValueError(f"approver {username!r} needs a public_key")
-        registry[username] = {"public_key": entry["public_key"],
-                              "revoked": bool(entry.get("revoked"))}
+            raise ValueError(f"{role} {username!r} needs a public_key")
+        record = {"public_key": entry["public_key"],
+                  "revoked": bool(entry.get("revoked"))}
+        hardware = entry.get("webauthn")
+        if hardware:
+            for field in ("credential_id", "public_key"):
+                if not hardware.get(field):
+                    raise ValueError(
+                        f"{role} {username!r}: webauthn enrolment needs {field}")
+            record["webauthn"] = dict(hardware)
+        registry[username] = record
     return registry
+
+
+def load_approvers(path):
+    return load_registry(path, "approver")
+
+
+def save_requesters():
+    """Write the requester registry back, so sign counts survive a restart.
+
+    A WebAuthn counter that resets on restart stops being able to detect a
+    cloned authenticator, which is the only thing it is for.
+    """
+    path = STATE.get("requesters_path")
+    if not path:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(STATE["service"].requesters, fh, indent=2, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
 
 
 def main():
@@ -303,6 +383,13 @@ def main():
                         default=os.environ.get("JUSTIKEY_DISCLOSURE_CLIENT_SECRET"),
                         help="shared secret the application authenticates with")
     parser.add_argument("--approvers", help="JSON file of enrolled approver public keys")
+    parser.add_argument("--requesters",
+                        help="JSON file of enrolled requester keys, for proof of presence")
+    parser.add_argument("--presence-mode", choices=("off", "enrolled", "required"),
+                        default=os.environ.get("JUSTIKEY_PRESENCE_MODE", "enrolled"),
+                        help="'required' refuses any disclosure without proof the "
+                             "requester is present; 'enrolled' requires it from every "
+                             "requester who has a key here")
     parser.add_argument("--ledger", default="disclosure-audit.db",
                         help="this service's own append-only ledger")
     parser.add_argument("--index-limit", type=int, default=600,
@@ -333,17 +420,28 @@ def main():
     STATE["index_limit"] = args.index_limit
     STATE["usage"] = disclosure.UsageStore(args.ledger)
     STATE["usage"].purge_expired()
+    STATE["requesters_path"] = args.requesters
     STATE["service"] = disclosure.DisclosureService(
         sealing.RecordOpener(private_hex),
         bytes.fromhex(args.index_key),
         load_approvers(args.approvers),
         usage=STATE["usage"],
-        max_disclosures=args.max_disclosures)
+        max_disclosures=args.max_disclosures,
+        requester_registry=load_registry(args.requesters, "requester"),
+        presence_mode=args.presence_mode)
+    if args.presence_mode == "required" and not args.requesters:
+        parser.error("--presence-mode required needs --requesters: with no enrolled "
+                     "requesters every disclosure would be refused")
 
     opener = STATE["service"]._opener
+    hardware = sorted(name for name, entry in STATE["service"].requesters.items()
+                      if entry.get("webauthn"))
     record("service_started", "disclosure-service", {
         "key_id": opener.key_id, "approvers": sorted(STATE["service"].approvers),
-        "max_disclosures": STATE["service"].max_disclosures})
+        "max_disclosures": STATE["service"].max_disclosures,
+        "presence_mode": STATE["service"].presence_mode,
+        "requesters": sorted(STATE["service"].requesters),
+        "requesters_on_hardware": hardware})
 
     print(f"JustiKey disclosure service on http://{args.host}:{args.port}")
     print(f"  public key : {opener.public_hex}")
@@ -351,6 +449,9 @@ def main():
     print(f"  approvers  : {', '.join(sorted(STATE['service'].approvers)) or '(none enrolled)'}")
     print(f"  ledger     : {args.ledger}")
     print(f"  use cap    : {STATE['service'].max_disclosures or 'unlimited'} per approval")
+    print(f"  presence   : {args.presence_mode} "
+          f"({len(STATE['service'].requesters)} requester(s) enrolled, "
+          f"{len(hardware)} on hardware)")
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()

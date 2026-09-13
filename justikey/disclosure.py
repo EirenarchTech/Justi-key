@@ -43,7 +43,8 @@ import threading
 from datetime import timedelta
 from urllib import error, request
 
-from . import approvals, config, crypto_store, sealing, timeutil
+from . import (approvals, config, crypto_store, custody, presence,  # noqa: F401
+               sealing, timeutil)
 
 MODE_LOCAL = "local"
 MODE_REMOTE = "remote"
@@ -158,11 +159,31 @@ class UsageStore:
         finally:
             conn.close()
 
+    def claim_presence_nonce(self, nonce, expires_at):
+        """Spend one proof of presence. Returns False if it was already used.
+
+        A third namespace, deliberately: approval nonces identify a capability
+        that may be spent N times, transport nonces guard one HTTP request,
+        and these guard one human confirmation. Collapsing any two of them
+        would make one of the three limits silently weaker.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM presence_nonces WHERE expires_at < ?",
+                         (timeutil.now_iso(),))
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO presence_nonces (nonce, expires_at, used_at) "
+                "VALUES (?,?,?)", (nonce, expires_at, timeutil.now_iso()))
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
     def purge_expired(self):
         conn = self._connect()
         try:
-            conn.execute("DELETE FROM authorization_usage WHERE expires_at < ?",
-                         (timeutil.now_iso(),))
+            now = timeutil.now_iso()
+            conn.execute("DELETE FROM authorization_usage WHERE expires_at < ?", (now,))
+            conn.execute("DELETE FROM presence_nonces WHERE expires_at < ?", (now,))
         finally:
             conn.close()
 
@@ -171,12 +192,18 @@ class DisclosureService:
     """Holds the private key and the index key. Opens only what an approval covers."""
 
     def __init__(self, opener, index_key, approver_registry=None, usage=None,
-                 max_disclosures=None):
+                 max_disclosures=None, requester_registry=None, presence_mode=None):
         self._opener = opener
         self._index_key = index_key
         # username -> {"public_key": hex, "revoked": bool}. Held by the
         # service, never supplied by the caller.
         self.approvers = approver_registry or {}
+        # Requesters are enrolled separately from approvers, in their own
+        # registry, so a requester's key can never be presented as an
+        # approver's. Two roles, two lists, no field to get wrong.
+        self.requesters = requester_registry or {}
+        self.presence_mode = (config.PRESENCE_MODE if presence_mode is None
+                              else presence_mode)
         self._usage = usage
         self.max_disclosures = (config.MAX_DISCLOSURES_PER_AUTHORIZATION
                                 if max_disclosures is None else max_disclosures)
@@ -189,6 +216,17 @@ class DisclosureService:
     def last_use_count(self):
         """Uses spent by the approval this thread most recently disclosed on."""
         return getattr(self._local, "use_count", None)
+
+    @property
+    def last_presence(self):
+        """What the most recent disclosure proved about the requester.
+
+        None when presence was not required. Otherwise carries `custody`,
+        which is the difference between "someone typed a password" and
+        "someone touched a security key" -- a distinction an audit trail that
+        records only "disclosed" cannot make.
+        """
+        return getattr(self._local, "presence", None)
 
     # -- scope tokens ----------------------------------------------------
 
@@ -205,6 +243,50 @@ class DisclosureService:
         if entry.get("revoked"):
             raise DisclosureError(f"approver {username!r}'s signing key has been revoked")
         return entry["public_key"]
+
+    def _requester_credential(self, username):
+        """The requester's enrolled key, as this service holds it.
+
+        Same rule as approvers: never taken from the request. A compromised
+        application that could supply the key it is proving presence with
+        would be proving nothing at all.
+        """
+        entry = self.requesters.get(username)
+        if entry is None:
+            return None
+        try:
+            return custody.credential_from_registry(
+                entry, rp_id=config.WEBAUTHN_RP_ID, origin=config.WEBAUTHN_ORIGIN)
+        except custody.CustodyError as exc:
+            raise DisclosureError(f"requester {username!r}: {exc}") from exc
+
+    def verify_presence(self, statement, requester, proof_statement, proof):
+        """Require evidence the requester is actually here, if policy says so.
+
+        Returns the single-use request nonce to spend, or None when presence
+        is not required for this requester.
+        """
+        if self.presence_mode == "off":
+            return None
+        credential = self._requester_credential(requester)
+        if credential is None:
+            if self.presence_mode == "required":
+                raise DisclosureError(
+                    f"requester {requester!r} has no signing key enrolled with this "
+                    f"service, and proof of presence is required")
+            return None                      # 'enrolled': not yet migrated
+        if not proof_statement or not proof:
+            raise DisclosureError(
+                "this disclosure needs proof that the requester is present; an "
+                "approval on its own is not sufficient")
+        try:
+            result = presence.verify(
+                credential, proof_statement, proof, statement, requester,
+                require_user_verification=config.WEBAUTHN_REQUIRE_USER_VERIFICATION)
+        except presence.PresenceError as exc:
+            raise DisclosureError(str(exc)) from exc
+        self._local.presence = result
+        return result
 
     def verify_approval(self, statement, signature_hex):
         """Check an approval on the service's own terms.
@@ -240,11 +322,26 @@ class DisclosureService:
 
     # -- the operation ----------------------------------------------------
 
-    def disclose(self, rows, statement, signature_hex, requester):
+    def disclose(self, rows, statement, signature_hex, requester,
+                 proof_statement=None, proof=None):
         """Open the records an approval covers, and no others."""
+        self._local.presence = None
         self.verify_approval(statement, signature_hex)
         if statement["requester"] != requester:
             raise DisclosureError("this approval belongs to another requester")
+
+        # Presence first, and before any use is spent: a request that cannot
+        # show the requester is here must not consume the approval's budget,
+        # or refusing it would still cost the officer a disclosure.
+        presence_result = self.verify_presence(statement, requester, proof_statement, proof)
+        if presence_result is not None and self._usage is not None:
+            # One proof, one disclosure. Without this the proof is good for
+            # its whole TTL and a captured one buys a burst.
+            if not self._usage.claim_presence_nonce(
+                    presence_result["request_nonce"], statement["approval_expires_at"]):
+                raise DisclosureError(
+                    "this proof of presence has already been used; the requester "
+                    "must confirm again")
 
         # Consume a use before opening anything. A compromised application can
         # present a genuine approval repeatedly; the count that stops it has to
@@ -322,15 +419,23 @@ class RemoteDisclosureService:
         """
         return self._post("/index", {"plate": plate})["plate_index"]
 
-    def disclose(self, rows, statement, signature_hex, requester):
+    def disclose(self, rows, statement, signature_hex, requester,
+                 proof_statement=None, proof=None):
         if len(rows) > MAX_ROWS_PER_REQUEST:
             raise DisclosureError(f"too many candidate rows for one disclosure ({len(rows)})")
-        result = self._post("/disclose", {
+        payload = {
             "rows": [{k: row.get(k) for k in WIRE_FIELDS} for row in rows],
             "statement": statement,
             "signature": signature_hex,
             "requester": requester,
-        })
+        }
+        if proof_statement is not None:
+            # Carried, never interpreted: this client does not decide whether
+            # presence was adequate. The service holds the requester's
+            # enrolled key and makes that judgement for itself.
+            payload["presence"] = proof_statement
+            payload["presence_proof"] = proof
+        result = self._post("/disclose", payload)
         return result.get("opened", [])
 
 
@@ -418,7 +523,8 @@ def service_for(conn, db_path):
     return DisclosureService(sealing.RecordOpener(private_hex),
                              crypto_store.resolve_index_key(db_path),
                              local_approver_registry(conn),
-                             usage=UsageStore(db_path))
+                             usage=UsageStore(db_path),
+                             requester_registry=local_requester_registry(conn))
 
 
 def remote_client():
@@ -439,16 +545,36 @@ def remote_client():
                                    config.DISCLOSURE_CLIENT_SECRET)
 
 
-def local_approver_registry(conn):
-    """Approver keys as the local-mode service sees them.
+def _registry(conn, role):
+    """Enrolled keys for one role, as the local-mode service sees them.
 
     In remote mode the service keeps its own enrolment and never asks the
     application, which is what stops a compromised application from
     presenting a key it controls.
+
+    A live hardware credential wins over the software key: a principal who
+    has enrolled an authenticator should not still be accepted on a password.
     """
     rows = conn.execute(
-        "SELECT username, signing_pub, signing_key_revoked_at FROM users "
-        "WHERE signing_pub IS NOT NULL").fetchall()
-    return {r["username"]: {"public_key": r["signing_pub"],
-                            "revoked": bool(r["signing_key_revoked_at"])}
-            for r in rows}
+        "SELECT id, username, signing_pub, signing_key_revoked_at FROM users "
+        "WHERE role=? AND signing_pub IS NOT NULL", (role,)).fetchall()
+    registry = {}
+    for row in rows:
+        entry = {"public_key": row["signing_pub"],
+                 "revoked": bool(row["signing_key_revoked_at"])}
+        hardware = conn.execute(
+            "SELECT credential_id, public_key, sign_count, rp_id, origin "
+            "FROM webauthn_credentials WHERE user_id=? AND revoked_at IS NULL "
+            "ORDER BY created_at ASC LIMIT 1", (row["id"],)).fetchone()
+        if hardware is not None:
+            entry["webauthn"] = dict(hardware)
+        registry[row["username"]] = entry
+    return registry
+
+
+def local_approver_registry(conn):
+    return _registry(conn, "approver")
+
+
+def local_requester_registry(conn):
+    return _registry(conn, "requester")

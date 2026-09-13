@@ -89,6 +89,39 @@ RETENTION_DAYS = int(os.environ.get("JUSTIKEY_RETENTION_DAYS", 365))
 # bounds both the replay window and how long spent nonces must be remembered.
 INGEST_SIGNATURE_WINDOW_SECONDS = int(os.environ.get("JUSTIKEY_SIGNATURE_WINDOW", 300))
 
+# --- Requester proof-of-presence (stage 4) ---------------------------------
+# An approval alone is a bearer capability: whoever holds the row can spend it
+# in the requester's name. Requiring the requester to sign each disclosure as
+# they ask for it means a compromised application cannot use a stored
+# approval on its own. See justikey/presence.py.
+#
+# "required" refuses any disclosure without a proof. "enrolled" (the default)
+# requires one from every requester who has a signing key, so a deployment can
+# enrol people without locking out the ones it has not reached yet. "off"
+# disables the check.
+PRESENCE_MODE = os.environ.get("JUSTIKEY_PRESENCE_MODE", "enrolled")
+
+# How long a freshly signed proof stays usable. Short by design: a captured
+# proof should be worth one disclosure in the next minute, not the whole
+# remaining life of the authorization.
+PRESENCE_TTL_SECONDS = int(os.environ.get("JUSTIKEY_PRESENCE_TTL", 120))
+
+# The longest lifetime the verifier will accept in a proof, whatever the
+# proof claims for itself.
+PRESENCE_MAX_TTL_SECONDS = int(os.environ.get("JUSTIKEY_PRESENCE_MAX_TTL", 300))
+
+# --- Hardware custody (stage 4) --------------------------------------------
+# WebAuthn assertions are bound to a relying party and an origin. Without
+# these, a hardware credential cannot be checked, because an assertion for
+# some other site would otherwise be indistinguishable from one for this one.
+WEBAUTHN_RP_ID = os.environ.get("JUSTIKEY_WEBAUTHN_RP_ID") or None
+WEBAUTHN_ORIGIN = os.environ.get("JUSTIKEY_WEBAUTHN_ORIGIN") or None
+# Whether an authenticator must report user verification (PIN or biometric)
+# and not merely presence. A touch proves someone is there; verification
+# proves it is the person enrolled.
+WEBAUTHN_REQUIRE_USER_VERIFICATION = os.environ.get(
+    "JUSTIKEY_WEBAUTHN_REQUIRE_UV", "1") == "1"
+
 # --- Brute-force resistance ------------------------------------------------
 MAX_FAILED_LOGINS = int(os.environ.get("JUSTIKEY_MAX_FAILED_LOGINS", 5))
 LOCKOUT_SECONDS = int(os.environ.get("JUSTIKEY_LOCKOUT_SECONDS", 900))
