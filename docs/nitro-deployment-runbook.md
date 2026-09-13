@@ -104,6 +104,17 @@ ARG KMS_KEY_ARN
 ARG PUBLIC_KEY
 ARG AWS_REGION
 
+# ARG values do NOT survive into the container's runtime environment. Without
+# these ENV lines the CMD below expands them to empty strings and the enclave
+# exits with "--client-secret is required" — the same failure an earlier draft
+# of this file produced for a different reason. Verified by building and
+# running both forms: ARG alone yields [], ARG + ENV yields the value.
+ENV CLIENT_SECRET=$CLIENT_SECRET \
+    INDEX_KEY=$INDEX_KEY \
+    KMS_KEY_ARN=$KMS_KEY_ARN \
+    PUBLIC_KEY=$PUBLIC_KEY \
+    AWS_REGION=$AWS_REGION
+
 # vsock only. The server exits 4 if asked to serve TCP while attested, and
 # exits 5 if given an ingest secret while attested.
 CMD python3 scripts/custodian_server.py \
@@ -116,6 +127,12 @@ CMD python3 scripts/custodian_server.py \
       --presence-mode required \
       --ledger /tmp/custodian-audit.db
 ```
+
+> Note what `ENV` means for the warning above: the values are then visible in
+> the image configuration itself — `docker history` and `docker inspect` print
+> them — before the EIF is even built. That is not a flaw in this Dockerfile;
+> it is the reason the index key and the client secret must not be real ones
+> here.
 
 > **The CMD in an earlier draft of this runbook was incomplete** — it named
 > only `--transport vsock --attest`, and an enclave built from it exits
