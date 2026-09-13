@@ -246,6 +246,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/publickey":
             return self._json(200, {"public_key": STATE["service"]._opener.public_hex,
                                     "key_id": STATE["service"]._opener.key_id,
+                                    "kem": STATE["service"]._opener.kem,
                                     "seal_version": sealing.FORMAT_VERSION})
         self._json(404, {"error": "not found"})
 
@@ -417,6 +418,9 @@ def main():
     parser.add_argument("--key", default=os.environ.get("JUSTIKEY_DISCLOSURE_KEY"),
                         help="disclosure private key (hex)")
     parser.add_argument("--key-file", help="file holding the disclosure private key")
+    parser.add_argument("--kem", default=os.environ.get("JUSTIKEY_DISCLOSURE_KEM"),
+                        help="key-agreement suite of the disclosure key; inferred "
+                             "from the key material when it carries one")
     parser.add_argument("--index-key", default=os.environ.get("JUSTIKEY_INDEX_KEY"),
                         help="blind-index key (hex); the application must not have this")
     parser.add_argument("--client-secret",
@@ -438,12 +442,18 @@ def main():
                         help="times one approval may be spent; 0 disables the cap")
     args = parser.parse_args()
 
-    private_hex = args.key
-    if not private_hex and args.key_file:
+    material = args.key
+    if not material and args.key_file:
         with open(args.key_file, "r") as fh:
-            private_hex = fh.read().strip()
-    if not private_hex:
+            material = fh.read().strip()
+    if not material:
         parser.error("a disclosure private key is required (--key or --key-file)")
+    # Key material carries its own suite (`<kem>:<hex>`); bare hex is the v3
+    # form and is read as X25519. --kem overrides both, for a key handed over
+    # out of band.
+    kem_name, private_hex = disclosure.decode_key(material)
+    if args.kem:
+        kem_name = args.kem
     if not args.index_key:
         parser.error("--index-key is required: the application must not hold it")
     if not args.client_secret:
@@ -473,7 +483,7 @@ def main():
         sys.exit(3)
 
     STATE["service"] = disclosure.DisclosureService(
-        sealing.RecordOpener(private_hex),
+        sealing.RecordOpener(private_hex, kem_name),
         bytes.fromhex(args.index_key),
         admitted["approver"][0],
         usage=STATE["usage"],

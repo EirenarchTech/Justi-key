@@ -211,7 +211,10 @@ class TestTheWholeCeremonyRemote(CeremonyTest):
         import disclosure_server
         from justikey import approvals, db, disclosure
 
-        self.private_hex, self.public_hex = sealing.generate_keypair()
+        from justikey import kem
+
+        self.kem = kem.DEFAULT_KEM
+        self.private_hex, self.public_hex = sealing.generate_keypair(self.kem)
         self.index_key = secrets.token_bytes(32)
         self.secret = secrets.token_hex(32)
 
@@ -237,7 +240,7 @@ class TestTheWholeCeremonyRemote(CeremonyTest):
             "ledger": ledger, "client_secret": self.secret, "index_limit": 0,
             "usage": usage,
             "service": disclosure.DisclosureService(
-                sealing.RecordOpener(self.private_hex), self.index_key,
+                sealing.RecordOpener(self.private_hex, self.kem), self.index_key,
                 {"supervisor1": {"public_key": public, "revoked": False}},
                 usage=usage, max_disclosures=0),
         })
@@ -252,6 +255,7 @@ class TestTheWholeCeremonyRemote(CeremonyTest):
             "JUSTIKEY_DISCLOSURE_CLIENT_ID": "app",
             "JUSTIKEY_DISCLOSURE_CLIENT_SECRET": self.secret,
             "JUSTIKEY_DISCLOSURE_PUBLIC_KEY": self.public_hex,
+            "JUSTIKEY_DISCLOSURE_KEM": self.kem,
             "JUSTIKEY_CEREMONY_PASSWORD": "pw",
         }
 
@@ -324,6 +328,7 @@ class TestTheWholeCeremonyRemote(CeremonyTest):
         config.DISCLOSURE_CLIENT_ID = "app"
         config.DISCLOSURE_CLIENT_SECRET = self.secret
         config.DISCLOSURE_PUBLIC_KEY = self.public_hex
+        config.DISCLOSURE_KEM = self.kem
         self.addCleanup(self._restore_config)
 
         conn = db.get_connection(self.db)
@@ -369,6 +374,7 @@ class TestTheWholeCeremonyRemote(CeremonyTest):
         config.DISCLOSURE_URL = ""
         config.DISCLOSURE_CLIENT_SECRET = ""
         config.DISCLOSURE_PUBLIC_KEY = ""
+        config.DISCLOSURE_KEM = None
 
 
 if __name__ == "__main__":

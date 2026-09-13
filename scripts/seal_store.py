@@ -148,9 +148,9 @@ def store_digest(conn):
     digest = hashlib.sha256()
     count = 0
     for row in conn.execute(
-            "SELECT id, record_uid, seal_version, recipient_key_id, plate_index, "
-            "captured_at, camera_id, record_ct, wrapped_key, ephemeral_pub "
-            "FROM lpr_events WHERE record_ct IS NOT NULL ORDER BY id"):
+            "SELECT id, record_uid, seal_version, seal_kem, recipient_key_id, "
+            "plate_index, captured_at, camera_id, record_ct, wrapped_key, "
+            "ephemeral_pub FROM lpr_events WHERE record_ct IS NOT NULL ORDER BY id"):
         digest.update(json.dumps([row[k] for k in row.keys()],
                                  separators=(",", ":")).encode("utf-8"))
         count += 1
@@ -235,7 +235,7 @@ def verify_sample_full(conn, db_path, samples, approver):
         window_start, window_end = row["captured_at"], row["captured_at"]
         statement = ceremony_statement(
             plate, window_start, window_end, "ceremony-requester", approver.username,
-            sealing.key_id(approver.public_hex), sequence)
+            approvals.signing_key_id(approver.public_hex), sequence)
         signature = approver.sign(statement)
 
         candidates = [dict(r) for r in models.search_events(
@@ -267,10 +267,10 @@ def verify_sample_structural(conn, db_path, row_ids):
     the blind index stored in the row. Needs the disclosure private key, so it
     runs where that key lives.
     """
-    private_hex = disclosure.load_private_key(db_path)
+    kem_name, private_hex = disclosure.load_private_key_material(db_path)
     if private_hex is None:
         return None, "the disclosure private key is not available on this host"
-    opener = sealing.RecordOpener(private_hex)
+    opener = sealing.RecordOpener(private_hex, kem_name)
     try:
         index_key = crypto_store.resolve_index_key(db_path)
     except crypto_store.EncryptionError as exc:
@@ -393,7 +393,7 @@ def cmd_migrate(args, conn):
     public_hex = disclosure.public_key_for(conn, args.db, create=True)
     if not public_hex:
         raise CeremonyError("no disclosure public key is available to seal against")
-    sealer = sealing.RecordSealer(public_hex)
+    sealer = sealing.RecordSealer(public_hex, disclosure.disclosure_kem(conn))
     approver = (resolve_approver(conn, args.approver) if args.approver
                 else CeremonyApprover())
     if args.approver is None and disclosure.is_remote():
@@ -422,16 +422,17 @@ def cmd_migrate(args, conn):
             conn.execute(
                 "UPDATE lpr_events SET plate='', location=NULL, plate_ct=NULL, "
                 "location_ct=NULL, plate_index=?, record_ct=?, wrapped_key=?, "
-                "ephemeral_pub=?, record_uid=?, seal_version=?, recipient_key_id=? "
-                "WHERE id=?",
+                "ephemeral_pub=?, record_uid=?, seal_version=?, seal_kem=?, "
+                "recipient_key_id=? WHERE id=?",
                 (index, env["record_ct"], env["wrapped_key"], env["ephemeral_pub"],
-                 env["record_uid"], env["seal_version"], env["recipient_key_id"],
-                 row["id"]))
+                 env["record_uid"], env["seal_version"], env.get("seal_kem"),
+                 env["recipient_key_id"], row["id"]))
             if position % sample_every == 0 and len(samples) < args.sample:
                 samples.append((row["id"], plate))
 
         crypto_store.set_meta(conn, "encryption_mode", crypto_store.MODE_V3)
         crypto_store.set_meta(conn, "disclosure_public_key", public_hex)
+        crypto_store.set_meta(conn, "disclosure_kem", sealer.kem)
         crypto_store.set_meta(conn, "sealed_at", timeutil.now_iso())
         conn.execute("COMMIT")
     except Exception:
@@ -468,6 +469,7 @@ def cmd_migrate(args, conn):
         "disclosure_public_key": public_hex,
         "disclosure_key_id": sealing.key_id(public_hex),
         "seal_version": sealing.FORMAT_VERSION,
+        "seal_kem": sealer.kem,
         "legacy_key_fingerprint": key_fingerprint(crypto_store.load_root_key(
             crypto_store.key_file_for(args.db))),
         "stages": [],

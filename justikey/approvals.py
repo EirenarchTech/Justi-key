@@ -62,6 +62,22 @@ class ApprovalKeyError(RuntimeError):
 # The signed statement
 # ---------------------------------------------------------------------------
 
+def signing_key_id(public_hex):
+    """Identifier for a *signing* key: an approver's or requester's Ed25519.
+
+    Deliberately its own function, and deliberately the plain digest it has
+    always been. It used to share `sealing.key_id`, which stage 5 changed to
+    bind a key-agreement suite -- a change that would have silently
+    invalidated the `approver_key_id` in every approval ever signed, because
+    verification rebuilds the statement and would have computed a different
+    identifier than the one the approver put their name to.
+
+    Signing keys have no KEM suite. Two different things were sharing one
+    function, and the day one of them changed was the day that mattered.
+    """
+    return sealing.legacy_key_id(public_hex)
+
+
 def statement_nonce(auth_row, approved_at):
     """Deterministic per-approval nonce.
 
@@ -206,7 +222,7 @@ def verify_authorization(conn, auth_row):
     statement = build_statement(
         auth_row, requester["username"], approver["username"],
         auth_row["approved_at"], auth_row["approval_expires_at"],
-        approver_key_id=sealing.key_id(approver["signing_pub"]))
+        approver_key_id=signing_key_id(approver["signing_pub"]))
     if not verify_statement(approver["signing_pub"], statement,
                             auth_row["approval_signature"]):
         return False, "approval signature does not match this authorization"
@@ -221,7 +237,7 @@ def approval_receipt(conn, auth_row):
     statement = build_statement(
         auth_row, requester["username"], approver["username"],
         auth_row["approved_at"], auth_row["approval_expires_at"],
-        approver_key_id=sealing.key_id(approver["signing_pub"]))
+        approver_key_id=signing_key_id(approver["signing_pub"]))
     return {
         "statement": statement,
         "signature": auth_row["approval_signature"],

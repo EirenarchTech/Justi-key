@@ -227,7 +227,8 @@ signature, there is no key, so there is no plaintext.
    from registration values obtained by any means. The disclosure key in an
    HSM or KMS that enforces the scope check itself also remains ahead.
 
-5. **Key isolation.** *(designed — [stage-5-key-isolation.md](stage-5-key-isolation.md))*
+5. **Key isolation.** *(built — `justikey/kem.py`, `justikey/custodian.py`;
+   see [stage-5-key-isolation.md](stage-5-key-isolation.md))*
    Compromise of the disclosure-service process must not reveal a reusable
    archive-decryption secret **or provide an unrestricted cryptographic
    oracle.** The second clause is the hard one: a non-exportable key in an
@@ -237,11 +238,29 @@ signature, there is no key, so there is no plaintext.
    custodian that independently verifies record identity, approval digest,
    proof of presence, scope and key version before agreeing to anything.
 
-   Checking the products first, as the design document records, found that
-   the current X25519 envelope is not supported for key agreement by AWS KMS,
-   Google Cloud KMS, Azure Managed HSM or YubiHSM 2. P-256 is universally
-   available; X25519 is not. That decides whether `jk-seal-v4` happens, and
-   it is a deployment question rather than a technical one.
+   Checking the products first found that the X25519 envelope is not
+   supported for key agreement by AWS KMS, Google Cloud KMS, Azure Managed
+   HSM or YubiHSM 2, so `jk-seal-v4` moves to P-256 — with the suite named in
+   the record and bound into the AAD, so the next primitive is an entry in
+   `kem.py` rather than a `v5`.
+
+   The backend is AWS KMS with **Nitro attestation**, which is what turns
+   "the key is in a KMS" into a control: with `Recipient` set, KMS encrypts
+   the derived secret to the attested enclave and returns an empty
+   `SharedSecret`, and the key policy can require a specific enclave
+   measurement. A compromised parent process holding the same IAM
+   credentials is refused by KMS itself — the one control here that does not
+   depend on this project's code being correct.
+
+   Measured against a 25-record archive, with the disclosure service fully
+   compromised: calling KMS directly obtained 0 secrets in 25 attempts; the
+   custodian refused all 25 unauthorized opens; and one genuine approval
+   naming one vehicle, replayed across every row, revealed exactly that one
+   vehicle.
+
+   **Not built:** the custodian does not yet run as its own enclave process,
+   and the AWS behaviour is exercised against a stand-in that implements the
+   documented policy semantics rather than against AWS.
 
 Each stage closed a hole the previous one made visible: stage 2's split made
 it obvious the application still held the index key, stage 3's chokepoint

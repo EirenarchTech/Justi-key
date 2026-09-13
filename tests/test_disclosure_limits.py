@@ -67,7 +67,7 @@ class ApprovalFixture(unittest.TestCase):
             expires = timeutil.to_canonical(self.now + timedelta(days=expires_in_days))
         statement = approvals.build_statement(
             auth, "officer1", "supervisor1", auth["approved_at"], expires,
-            approver_key_id=sealing.key_id(approver["signing_pub"]))
+            approver_key_id=approvals.signing_key_id(approver["signing_pub"]))
         return statement, auth["approval_signature"]
 
     def candidates(self, statement):

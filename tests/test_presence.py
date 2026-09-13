@@ -85,7 +85,7 @@ class PresenceTest(unittest.TestCase):
         return approvals.build_statement(
             auth, "officer1", "supervisor1", auth["approved_at"],
             auth["approval_expires_at"],
-            approver_key_id=sealing.key_id(approver["signing_pub"])), auth["approval_signature"]
+            approver_key_id=approvals.signing_key_id(approver["signing_pub"])), auth["approval_signature"]
 
     def rows_for(self, statement):
         return [dict(r) for r in models.search_events(

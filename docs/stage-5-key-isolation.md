@@ -128,9 +128,86 @@ From review, with how each is addressed:
 | HSM/KMS failure fails closed | the existing `disclosure_unavailable` posture, extended: no fallback path that opens records without the custodian |
 | Key rotation leaves authorized historical records decryptable | `recipient_key_id` is already a version handle; custodian holds N versions, none exportable |
 
-## Open question for the deployment
+---
 
-Which custody backend is being targeted — AWS KMS, GCP KMS, Azure Managed
-HSM, or an on-premise PKCS#11 device — decides whether the envelope moves to
-P-256 and whether the v3 → v4 reseal happens now or later. Everything else in
-this document is independent of that choice.
+## What was built
+
+`jk-seal-v4`, with the suite named in the record rather than assumed:
+
+```
+seal_version      jk-seal-v4
+seal_kem          P256-ECDH-HKDF-SHA256
+recipient_key_id  <suite-bound key id>
+ephemeral_pub     <validated uncompressed SEC1 P-256 point>
+```
+
+`kem` is bound into the AEAD associated data alongside the KDF and AEAD
+names, so a record cannot be reinterpreted under a weaker primitive than the
+one it was sealed with, and a stripped `seal_kem` is a refusal rather than a
+default. `justikey/kem.py` holds the suites; adding the next primitive is an
+entry there, not `jk-seal-v5`.
+
+`justikey/custodian.py` offers exactly one operation:
+
+```python
+open(envelope, identity, statement, signature, requester,
+     proof_statement, proof, registry_versions, blind_index_of)
+```
+
+There is no `derive`, no `agree`, no `unwrap` — a test asserts those
+attributes do not exist, because the oracle restated as an API is the thing
+being avoided. `blind_index_of` is required: a custodian that accepted the
+caller's word for which records are in scope would have re-created the
+oracle with extra steps.
+
+Backends: `LocalAgreement` (software, development, and the reference the
+hardware path is checked against — `meets_stage_5` is `False` and says so)
+and `KmsAgreement` (AWS KMS `DeriveSharedSecret`, `ECC_NIST_P256`,
+`KeyUsage=KEY_AGREEMENT`). With `Recipient` set, KMS returns
+`CiphertextForRecipient` and an empty `SharedSecret`; a response that carries
+*both* is refused, because that is not the attested path and the plaintext
+secret just reached the parent. `meets_stage_5` is true only for the attested
+configuration.
+
+### Measured
+
+Same adversary as every other stage: full control of the disclosure service
+— its database, its KMS credentials, the code it runs. 25 sealed records.
+
+```
+attack 1: call KMS directly, once per row
+  rows walked 25    secrets obtained 0    denied by KMS policy 25
+
+attack 2: ask the custodian for each row, with no authorization
+  rows attempted 25    opened 0    refused 25
+
+attack 3: ONE genuine approval for CAR007, replayed across every row
+  rows attempted 25    opened 1    refused 24
+  plates revealed: ['CAR007']
+```
+
+The third is the one that matters. A live, genuine, correctly signed approval
+naming one vehicle, driven across the entire archive by a fully compromised
+service, yields that one vehicle.
+
+### Where the evidence stops
+
+Attack 1 is the only control that does not depend on JustiKey's code being
+correct — and it is enforced by AWS, not here. `tests/fake_kms.py` implements
+the documented policy semantics (attested calls get an empty `SharedSecret`;
+`kms:RecipientAttestation:ImageSha384` refuses a mismatched, revoked, or
+absent attestation) so the JustiKey side is testable. **These tests prove
+JustiKey behaves correctly given that behaviour. They are not evidence about
+AWS.** Confirming the real service behaves as documented is a deployment
+step, not a unit test.
+
+Two things also remain unbuilt: the custodian does not yet run as its own
+process behind an enclave, and the v3 → v4 reseal is available through the
+existing ceremony but has not been run against a production store.
+
+## Decided
+
+AWS KMS, P-256, `jk-seal-v4`, with Nitro attestation as the production
+boundary. The attestation path is what turns "the key is in a KMS" into a
+control: without it, a compromised parent holding the same IAM credentials
+makes the same call the custodian does.

@@ -144,7 +144,7 @@ def evaluate_disclosure(conn, auth_id, requested_plate, actor_user,
     statement = approvals.build_statement(
         auth_row, actor_user["username"], approver["username"],
         auth_row["approved_at"], auth_row["approval_expires_at"],
-        approver_key_id=sealing.key_id(approver["signing_pub"]))
+        approver_key_id=approvals.signing_key_id(approver["signing_pub"]))
     # Proof of presence. An approval is a bearer capability until the person
     # it belongs to shows up for this specific request, so the proof is built
     # over the statement that was actually signed and nothing else.

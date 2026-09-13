@@ -164,7 +164,7 @@ def sealer_for(conn):
             if public_hex is None:
                 raise crypto_store.EncryptionError(
                     "this database seals observations but no disclosure public key is available")
-            conn._sealer = sealing.RecordSealer(public_hex)
+            conn._sealer = sealing.RecordSealer(public_hex, disclosure.disclosure_kem(conn))
         conn._sealer_loaded = True
     return conn._sealer
 
@@ -205,12 +205,12 @@ def insert_event(conn, plate, captured_at, camera_id, confidence, location, sour
         cur = conn.execute(
             "INSERT INTO lpr_events (plate, captured_at, camera_id, confidence, location, "
             "source_id, source_ref, adapter, plate_index, record_ct, wrapped_key, "
-            "ephemeral_pub, record_uid, seal_version, recipient_key_id, ingested_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "ephemeral_pub, record_uid, seal_version, seal_kem, recipient_key_id, "
+            "ingested_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             ("", captured_at, camera_id, confidence, None, source_id, source_ref, adapter,
              index, env["record_ct"], env["wrapped_key"], env["ephemeral_pub"],
-             env["record_uid"], env["seal_version"], env["recipient_key_id"],
-             timeutil.now_iso()))
+             env["record_uid"], env["seal_version"], env.get("seal_kem"),
+             env["recipient_key_id"], timeutil.now_iso()))
         return cur.lastrowid
 
     cipher = cipher_for(conn)
@@ -372,10 +372,10 @@ def approve_authorization(conn, auth_id, approver_id, signing_key=None):
         requester = get_user_by_id(conn, auth_row["requested_by"])
         if approver is None or requester is None:
             return False, "not_found"
-        from . import sealing as _sealing
         statement = approvals.build_statement(
             auth_row, requester["username"], approver["username"], approved_at, expires,
-            approver_key_id=_sealing.key_id(approver["signing_pub"]) if approver["signing_pub"] else None)
+            approver_key_id=approvals.signing_key_id(approver["signing_pub"])
+            if approver["signing_pub"] else None)
         signature = approvals.sign_statement(signing_key, statement)
 
     cur = conn.execute(

@@ -196,7 +196,7 @@ class TestTheServiceDoesNotTrustItsCaller(SealedDatabaseTest):
         approver = models.get_user_by_id(self.conn, self.approver_id)
         self.statement = approvals.build_statement(
             auth, "officer1", "supervisor1", auth["approved_at"],
-            auth["approval_expires_at"], approver_key_id=sealing.key_id(approver["signing_pub"]))
+            auth["approval_expires_at"], approver_key_id=approvals.signing_key_id(approver["signing_pub"]))
         self.signature = auth["approval_signature"]
         self.all_rows = [dict(r) for r in
                          self.conn.execute("SELECT * FROM lpr_events").fetchall()]
@@ -265,7 +265,7 @@ class TestTheServiceDoesNotTrustItsCaller(SealedDatabaseTest):
             {"signing_key_ct": wrapped, "signing_key_salt": salt,
              "signing_pub": forged_pub}, "attacker")
         statement = dict(self.statement, target_plate="OTHER11",
-                         approver_key_id=sealing.key_id(forged_pub))
+                         approver_key_id=approvals.signing_key_id(forged_pub))
         signature = approvals.sign_statement(rogue_key, statement)
         with self.assertRaises(disclosure.DisclosureError):
             self.disclose(statement=statement, signature=signature)

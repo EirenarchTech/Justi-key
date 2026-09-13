@@ -149,7 +149,7 @@ def credential_key_id(credential):
         return hashlib.sha256(
             b"justikey:webauthn-credential:v1"
             + credential["credential_id"].encode("utf-8")).hexdigest()[:16]
-    return sealing.key_id(credential["public_key"])
+    return sealing.legacy_key_id(credential["public_key"])
 
 
 # ---------------------------------------------------------------------------

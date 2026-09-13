@@ -43,7 +43,7 @@ import threading
 from datetime import timedelta
 from urllib import error, request
 
-from . import (approvals, config, crypto_store, custody, presence,  # noqa: F401
+from . import (approvals, config, crypto_store, custody, kem, presence,  # noqa: F401
                sealing, timeutil)
 
 MODE_LOCAL = "local"
@@ -54,8 +54,9 @@ MAX_ROWS_PER_REQUEST = 5000
 
 # Only the sealed material and the fields needed to decide scope leave the
 # application. Nothing else about a row is the service's business.
-WIRE_FIELDS = ("id", "record_uid", "seal_version", "recipient_key_id", "plate_index",
-               "captured_at", "camera_id", "record_ct", "wrapped_key", "ephemeral_pub")
+WIRE_FIELDS = ("id", "record_uid", "seal_version", "seal_kem", "recipient_key_id",
+               "plate_index", "captured_at", "camera_id", "record_ct", "wrapped_key",
+               "ephemeral_pub")
 
 
 class DisclosureError(RuntimeError):
@@ -378,7 +379,7 @@ class DisclosureService:
                 raise DisclosureError(f"approval statement is missing {field}")
 
         public_hex = self._approver_key(statement["approver"])
-        if sealing.key_id(public_hex) != statement["approver_key_id"]:
+        if approvals.signing_key_id(public_hex) != statement["approver_key_id"]:
             raise DisclosureError(
                 "approval names a different signing key than the one enrolled")
         if statement["approver"] == statement["requester"]:
@@ -516,42 +517,106 @@ def key_file_for(db_path):
     return base + ".disclosure-key"
 
 
-def load_private_key(db_path, create=False):
-    """Resolve the disclosure private key (local mode only)."""
+def encode_key(kem_name, private_hex):
+    """Key material that says which suite it belongs to.
+
+    A 32-byte hex string is a valid X25519 key and a valid P-256 scalar, so a
+    bare hex file is ambiguous -- and an ambiguity in key material is resolved
+    by whichever suite the reader happens to default to, which is how records
+    get sealed under a primitive nobody chose.
+    """
+    return f"{kem_name}:{private_hex}"
+
+
+def decode_key(material):
+    """(kem_name, private_hex). Bare hex is read as X25519, which is what
+    every key written before v4 was."""
+    text = (material or "").strip()
+    if ":" in text:
+        name, _, private_hex = text.partition(":")
+        return name.strip(), private_hex.strip()
+    return kem.X25519_ECDH, text
+
+
+def disclosure_kem(conn):
+    """The suite this database's disclosure key uses.
+
+    Resolved the same way the public key is, and for the same reason: in
+    remote mode the application does not own this decision, the service does.
+    Asking it is better than defaulting, because a default that disagrees
+    with the key holder produces records nobody can open.
+    """
+    if config.DISCLOSURE_KEM:
+        return config.DISCLOSURE_KEM
+    stored = crypto_store.get_meta(conn, "disclosure_kem")
+    if stored:
+        return stored
+    if config.DISCLOSURE_URL:
+        name = fetch_key_info(config.DISCLOSURE_URL).get("kem")
+        if name:
+            crypto_store.set_meta(conn, "disclosure_kem", name)
+            return name
+    # A database sealed before v4 has no record of its suite because there was
+    # only one. Do not guess forward.
+    return kem.X25519_ECDH
+
+
+def load_private_key(db_path, create=False, kem_name=None):
+    """Resolve the disclosure private key (local mode only).
+
+    Returns the hex scalar. Use `load_private_key_material` when the suite
+    matters, which from v4 is everywhere that actually agrees a key.
+    """
+    return load_private_key_material(db_path, create=create, kem_name=kem_name)[1]
+
+
+def load_private_key_material(db_path, create=False, kem_name=None):
+    """(kem_name, private_hex) for the disclosure key, or (None, None)."""
     if config.DISCLOSURE_PRIVATE_KEY:
-        return config.DISCLOSURE_PRIVATE_KEY.strip()
+        return decode_key(config.DISCLOSURE_PRIVATE_KEY)
 
     import os
     path = key_file_for(db_path)
     if os.path.exists(path):
         with open(path, "r") as fh:
-            return fh.read().strip()
+            return decode_key(fh.read())
     if not create:
-        return None
+        return None, None
 
-    private_hex, _ = sealing.generate_keypair()
+    kem_name = kem_name or kem.DEFAULT_KEM
+    private_hex, _ = sealing.generate_keypair(kem_name)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         with open(path, "r") as fh:
-            return fh.read().strip()
+            return decode_key(fh.read())
     with os.fdopen(fd, "w") as fh:
-        fh.write(private_hex)
+        fh.write(encode_key(kem_name, private_hex))
     print(f"[justikey] generated a disclosure key at {path}. In local mode this "
           f"process can open sealed records and holds the index key, so the split "
           f"is structural only. Run scripts/disclosure_server.py for the separated "
           f"service.", file=sys.stderr)
-    return private_hex
+    return kem_name, private_hex
 
 
-def fetch_public_key(url, timeout=None):
+def fetch_key_info(url, timeout=None):
+    """What the service will seal to: public key, key id, and suite."""
     try:
         with request.urlopen(url.rstrip("/") + "/publickey",
                              timeout=timeout or config.DISCLOSURE_TIMEOUT_SECONDS) as response:
-            return json.loads(response.read().decode("utf-8"))["public_key"]
-    except (error.URLError, OSError, ValueError, KeyError) as exc:
+            return json.loads(response.read().decode("utf-8"))
+    except (error.URLError, OSError, ValueError) as exc:
         raise DisclosureError(
             f"could not fetch the disclosure public key from {url}: {exc!r}") from exc
+
+
+def fetch_public_key(url, timeout=None):
+    info = fetch_key_info(url, timeout)
+    try:
+        return info["public_key"]
+    except KeyError as exc:
+        raise DisclosureError(
+            f"{url} did not return a disclosure public key") from exc
 
 
 def public_key_for(conn, db_path, create=False):
@@ -567,8 +632,18 @@ def public_key_for(conn, db_path, create=False):
         return config.DISCLOSURE_PUBLIC_KEY.strip()
     if config.DISCLOSURE_URL:
         return fetch_public_key(config.DISCLOSURE_URL)
-    private_hex = load_private_key(db_path, create=create)
-    return sealing.public_from_private(private_hex) if private_hex else None
+
+    # Creating a key also fixes this database's suite, so record it: a
+    # database that cannot say which primitive its records use would have to
+    # guess, and guessing is what the suite field exists to prevent.
+    existing = crypto_store.get_meta(conn, "disclosure_kem")
+    kem_name, private_hex = load_private_key_material(
+        db_path, create=create, kem_name=existing or kem.DEFAULT_KEM)
+    if private_hex is None:
+        return None
+    if not existing:
+        crypto_store.set_meta(conn, "disclosure_kem", kem_name)
+    return sealing.public_from_private(private_hex, kem_name)
 
 
 def is_remote():
@@ -583,12 +658,12 @@ def service_for(conn, db_path):
     if config.DISCLOSURE_URL:
         return remote_client()
 
-    private_hex = load_private_key(db_path)
+    kem_name, private_hex = load_private_key_material(db_path)
     if private_hex is None:
         raise DisclosureError(
             "this database seals observations but no disclosure key is available; "
             "set JUSTIKEY_DISCLOSURE_KEY or point at a disclosure service")
-    return DisclosureService(sealing.RecordOpener(private_hex),
+    return DisclosureService(sealing.RecordOpener(private_hex, kem_name),
                              crypto_store.resolve_index_key(db_path),
                              local_approver_registry(conn),
                              usage=UsageStore(db_path),

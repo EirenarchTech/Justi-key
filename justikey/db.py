@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS lpr_events (
     -- Envelope identity, all authenticated as AAD alongside the ciphertext.
     record_uid TEXT,
     seal_version TEXT,
+    seal_kem TEXT,
     recipient_key_id TEXT,
     ingested_at TEXT NOT NULL
 );
@@ -280,6 +281,10 @@ EVENT_COLUMNS = (
     ("record_uid", "TEXT"),
     ("seal_version", "TEXT"),
     ("recipient_key_id", "TEXT"),
+    # v4: the key-agreement suite this record was sealed under, so the
+    # primitive is a property of the record rather than of the build that
+    # happens to be reading it. Bound into the AAD, so it cannot be edited.
+    ("seal_kem", "TEXT"),
 )
 
 AUTHORIZATION_COLUMNS = (

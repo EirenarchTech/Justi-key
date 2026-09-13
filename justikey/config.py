@@ -70,6 +70,13 @@ DISCLOSURE_TIMEOUT_SECONDS = float(os.environ.get("JUSTIKEY_DISCLOSURE_TIMEOUT",
 # anything. In remote mode it belongs to the disclosure service alone.
 INDEX_KEY_HEX = os.environ.get("JUSTIKEY_INDEX_KEY") or None
 
+# Key-agreement suite for sealing. Named rather than assumed, because the
+# suite decides which HSM or KMS can hold the key at all: AWS KMS, Google
+# Cloud KMS, Azure Managed HSM and YubiHSM 2 all refuse X25519 for key
+# agreement, so a non-exportable key is only purchasable at P-256.
+# See docs/stage-5-key-isolation.md.
+DISCLOSURE_KEM = os.environ.get("JUSTIKEY_DISCLOSURE_KEM") or None
+
 # --- Scope and retention limits --------------------------------------------
 # Widest time window an authorization may request. The approver is expected
 # to judge proportionality, but "not unnecessarily broad" should be enforced
