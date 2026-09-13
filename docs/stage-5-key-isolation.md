@@ -254,10 +254,112 @@ custodian prints a startup notice saying plainly that the configuration does
 not meet the stage 5 objective. That seemed better than letting a
 development configuration look like a production one.
 
-One piece is deliberately a refusal rather than a stub: decrypting
-`CiphertextForRecipient` requires the enclave's private key and the NSM
-device, so outside an enclave `--attestation-file` raises an error naming
-what is missing rather than silently degrading to an unattested call.
+### The recipient path, corrected
+
+An earlier draft of this document said the NSM decrypts
+`CiphertextForRecipient`. It does not, and the correction makes the design
+cleaner rather than harder. The NSM's job is to **produce and sign an
+attestation document**. The decryption key is an ordinary RSA keypair the
+enclave generates for itself:
+
+1. the enclave generates an RSA-2048 keypair in its own memory
+2. it asks the NSM for an attestation document carrying that public key
+3. KMS is called with `Recipient` = that document
+4. KMS returns the secret encrypted to that public key, `SharedSecret` empty
+5. the enclave decrypts with the private key, which never left its memory
+
+So everything except step 2 is ordinary cryptography that runs and is tested
+anywhere. Only the attestation document needs the device.
+
+**`CiphertextForRecipient` is not a bare RSA-OAEP blob.** It is a CMS
+`EnvelopedData` (RFC 5652): RSA-OAEP-SHA-256 wraps a content-encryption key,
+and the content itself is AES-256-CBC with the IV in the algorithm
+parameters. An implementation that RSA-decrypts the blob directly works
+against a convenient stand-in and fails against AWS, so `justikey/enclave.py`
+parses the real structure and `tests/fake_kms.py` produces genuine DER — the
+parser is exercised against the format rather than against a shortcut.
+
+The parser is strict where strictness is cheap: indefinite-length BER is
+refused, exactly one recipient is required, and the key-encryption and
+content-encryption algorithms are *checked* rather than read, because a
+parser that accepts whatever algorithm the blob names will accept one the
+sender chose.
+
+**A fresh recipient key per operation.** Each KMS agreement generates its
+own RSA keypair, so a captured `CiphertextForRecipient` is useless outside
+the single operation that asked for it — there is no longer-lived key to
+replay it against — and the lifetime story is one sentence rather than a
+rotation policy. Tested: a response produced for one operation, fed to the
+next, is refused with *"not encrypted to this operation's recipient key"*.
+
+Only step 2 is unavailable outside an enclave, and it is a **named refusal**
+rather than a stub: a fabricated attestation would be refused by KMS anyway,
+and a stand-in that looked real would let a development configuration pass
+for a production one.
+
+### The transport, and what it is not
+
+```
+CustodianClient
+    ├── HttpTransport     development and process tests
+    └── VsockTransport    Nitro production
+```
+
+On Nitro, vsock is the only channel between an enclave and its parent, the
+parent is always CID 3, and the enclave has no external network and no
+persistent storage. That is genuine isolation.
+
+**It is not authorization, and the distinction is worth stating twice.** Once
+the parent is inside the threat model — it runs the disclosure service — the
+parent holds whatever transport credential the parent holds. A shared secret
+proves the caller is the parent; the parent is the adversary. A CID proves
+which side of a socket someone is on; being on that side is not permission to
+read a plate. So the authorization remains entirely and only: approver
+signature, requester presence, scope, registry versions, nonce and cap state,
+record identity — verified by the custodian against its own copies.
+
+What the transport layer does own: an explicit length prefix with a ceiling
+checked **before** allocation, a read deadline, bounded concurrency (a
+refusal, not a queue — an enclave has a fixed memory allocation), one request
+per connection, and a strict schema in which unknown fields are refused
+rather than ignored, because a field this version ignores is one a later
+version might read.
+
+Both transports call **one** dispatch function. Two dispatch tables would be
+two lists of what the custodian accepts, and the day they disagree is the day
+one transport offers something the other refuses.
+
+### A production invariant, enforced
+
+**An attested custodian refuses to start a TCP listener** and exits 4. A
+Nitro enclave's only channel is AF_VSOCK, so a TCP listener in an attested
+configuration means either this is not really an enclave or something has
+been arranged to reach it that should not exist — refusing is cheaper than
+finding out which. Development may use HTTP; it simply may not claim to be
+attested, and an unattested custodian prints a startup notice saying so.
+
+Tested as a real subprocess, because an invariant asserted by reading the
+source is an invariant that survives the code being deleted.
+
+### The vsock attacks
+
+| Attack | Result |
+|---|---|
+| parent sends `derive` (or `agree`, `unwrap`, `decrypt`, `privatekey`) | refused: unknown operation |
+| parent sends `open` carrying multiple records | refused: `open` takes exactly one record |
+| parent replays a completed `open` frame verbatim | refused: proof of presence already used |
+| parent sends oversized, truncated, non-JSON, wrong-magic or unknown-field frames | refused before allocation; the server does not hang |
+| parent feeds a stale `CiphertextForRecipient` to a later `open` | refused: not encrypted to this operation's recipient key |
+
+And the archive attack is re-run over the framed path, giving the same
+answer as over HTTP — which is the point: swapping TCP for vsock must not
+move record selection outside the custodian.
+
+**What this kernel could not test.** It has `AF_VSOCK` and permits binding a
+listener (exercised), but has no `vsock_loopback`, so a local connect times
+out. The framing is therefore driven over a socketpair — the same code on
+the same sockets, minus the kernel's vsock routing. Confirming that routing
+needs a real enclave.
 
 ### Where the evidence stops
 
@@ -270,11 +372,13 @@ JustiKey behaves correctly given that behaviour. They are not evidence about
 AWS.** Confirming the real service behaves as documented is a deployment
 step, not a unit test.
 
-What remains: the enclave-side decryption of `CiphertextForRecipient` (it
-needs the NSM device, so it is a named refusal outside an enclave rather than
-a stub), a vsock transport to replace TCP in production, and the v3 → v4
-reseal, which is available through the existing ceremony but has not been run
-against a production store.
+What remains is no longer code-shaped. The NSM attestation request needs the
+device; the vsock round trip needs a kernel with vsock routing; the KMS
+behaviour needs KMS. Each is a named refusal or a stated gap rather than a
+stub, and the next meaningful evidence is a small real Nitro + KMS
+deployment rather than another stand-in. The v3 → v4 reseal is available
+through the existing ceremony but has not been run against a production
+store.
 
 ## Decided
 

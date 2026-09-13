@@ -65,9 +65,121 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from justikey import (custodian, disclosure, kem, registry, sealing,  # noqa: E402
-                      servicekit)
+                      servicekit, transport)
 
 STATE = {}
+
+
+# ---------------------------------------------------------------------------
+# One dispatch, both transports
+# ---------------------------------------------------------------------------
+#
+# HTTP and vsock call exactly this. Two dispatch tables would be two lists of
+# what the custodian accepts, and the day they disagree is the day one
+# transport offers something the other refuses.
+
+ALLOWED_FIELDS = {
+    "index": {"plate"},
+    "open": {"envelope", "identity", "statement", "signature", "requester",
+             "presence", "presence_proof", "registry_versions"},
+    "publickey": set(),
+}
+
+
+def dispatch(operation, payload):
+    """(reply, status). Unknown operations are refused by name."""
+    if operation not in ALLOWED_FIELDS:
+        return {"error": f"unknown operation {operation!r}"}, 404
+    unknown = set(payload or {}) - ALLOWED_FIELDS[operation]
+    if unknown:
+        # Refused rather than ignored: a field this version ignores is a field
+        # a later version might read, and the two would disagree about what
+        # the message meant.
+        return {"error": f"unknown fields for {operation}: {sorted(unknown)}"}, 400
+    return _OPERATIONS[operation](payload or {})
+
+
+def op_publickey(_payload):
+    agreement = STATE["custodian"].agreement
+    return {
+        "public_key": agreement.public_raw.hex(),
+        "key_id": agreement.key_id,
+        "kem": agreement.kem,
+        "seal_version": sealing.FORMAT_VERSION,
+        "backend": agreement.backend,
+        # Stated rather than implied: a deployment should be able to see from
+        # the outside whether this custodian meets the stage 5 objective.
+        "attested": bool(getattr(agreement, "meets_stage_5", False)),
+        "registry_versions": STATE["registry_versions"],
+    }, 200
+
+
+def op_index(payload):
+    """A scope token, for the disclosure service's own candidate search.
+
+    The custodian holds an index key so it can re-derive scope for itself at
+    disclosure time. Exposing it here means the disclosure service need not
+    hold a second copy -- but it is the same grinding channel described in
+    threat-model finding 1, so it is rate limited and every call is recorded.
+    """
+    plate = payload.get("plate")
+    if not isinstance(plate, str) or not plate.strip():
+        return {"error": "plate is required"}, 400
+    if not index_rate_ok():
+        STATE["record"]("index_rate_limited", "client",
+                        {"limit_per_minute": STATE["index_limit"]})
+        return {"error": "scope-token rate limit exceeded"}, 429
+    STATE["record"]("scope_token_issued", "client", {})
+    return {"plate_index": blind_index(plate)}, 200
+
+
+def op_open(payload):
+    envelope = payload.get("envelope")
+    identity = payload.get("identity")
+    requester = payload.get("requester")
+    if not isinstance(envelope, dict) or not isinstance(identity, dict):
+        return {"error": "envelope and identity are required"}, 400
+    # One record. A list here would let a caller hand over the table and have
+    # the custodian sort out which ones it likes, which is the oracle's shape.
+    if isinstance(envelope.get("record_uid"), (list, tuple)):
+        return {"error": "open takes exactly one record"}, 400
+
+    statement = payload.get("statement")
+    try:
+        result = STATE["custodian"].open(
+            envelope, identity, statement, payload.get("signature"), requester,
+            payload.get("presence"), payload.get("presence_proof"),
+            registry_versions=payload.get("registry_versions"),
+            blind_index_of=blind_index)
+    except custodian.AgreementUnavailable as exc:
+        # The key holder being unreachable is an operating state, not a fault,
+        # and never a reason to open anything another way.
+        STATE["record"]("agreement_unavailable", f"requester:{requester}",
+                        {"reason": str(exc)[:300]})
+        return {"error": str(exc)}, 503
+    except custodian.CustodianError as exc:
+        STATE["record"]("open_refused", f"requester:{requester}", {
+            "reason": str(exc)[:300], "record_uid": envelope.get("record_uid"),
+            "case": statement.get("case_number") if isinstance(statement, dict) else None})
+        return {"error": str(exc)}, 403
+
+    # Recorded before the response is written: an opening that reached the
+    # caller but not the ledger is exactly the gap that matters.
+    STATE["record"]("open_granted", f"requester:{requester}", {
+        "record_uid": envelope.get("record_uid"),
+        "authorization_id": statement.get("authorization_id")
+        if isinstance(statement, dict) else None,
+        "approver": statement.get("approver") if isinstance(statement, dict) else None,
+        "use_count": result["use_count"], "presence": result["presence"],
+        "suite": result["suite"], "backend": result["backend"],
+        "context": result["context_digest"]})
+    # The plate never enters this ledger. Recording it here would rebuild the
+    # archive the custodian exists to protect.
+    return {"fields": result["fields"], "use_count": result["use_count"],
+            "presence": result["presence"], "context": result["context_digest"]}, 200
+
+
+_OPERATIONS = {"index": op_index, "open": op_open, "publickey": op_publickey}
 
 
 class Handler(servicekit.AuthenticatedHandler, BaseHTTPRequestHandler):
@@ -81,92 +193,19 @@ class Handler(servicekit.AuthenticatedHandler, BaseHTTPRequestHandler):
         if self.path == "/healthz":
             return self._json(200, {"status": "ok"})
         if self.path == "/publickey":
-            agreement = STATE["custodian"].agreement
-            return self._json(200, {
-                "public_key": agreement.public_raw.hex(),
-                "key_id": agreement.key_id,
-                "kem": agreement.kem,
-                "seal_version": sealing.FORMAT_VERSION,
-                "backend": agreement.backend,
-                # Stated rather than implied: a deployment should be able to
-                # see from the outside whether this custodian is running in a
-                # configuration that meets the stage 5 objective.
-                "attested": bool(getattr(agreement, "meets_stage_5", False)),
-                "registry_versions": STATE["registry_versions"],
-            })
+            reply, status = dispatch("publickey", {})
+            return self._json(status, reply)
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path not in ("/index", "/open"):
+        operation = self.path.lstrip("/")
+        if operation not in ALLOWED_FIELDS:
             return self._json(404, {"error": "not found"})
         payload = self._payload()
         if payload is None:
             return
-        if self.path == "/index":
-            return self._handle_index(payload)
-        return self._handle_open(payload)
-
-    def _handle_index(self, payload):
-        """A scope token, for the disclosure service's own candidate search.
-
-        The custodian holds an index key so it can re-derive scope for itself
-        at disclosure time. Exposing it here as well means the disclosure
-        service need not hold a second copy -- but it is the same grinding
-        channel described in threat-model finding 1, so it is rate limited
-        and every call is recorded.
-        """
-        plate = payload.get("plate")
-        if not isinstance(plate, str) or not plate.strip():
-            return self._json(400, {"error": "plate is required"})
-        if not index_rate_ok():
-            STATE["record"]("index_rate_limited", "client",
-                            {"limit_per_minute": STATE["index_limit"]})
-            return self._json(429, {"error": "scope-token rate limit exceeded"})
-        STATE["record"]("scope_token_issued", "client", {})
-        return self._json(200, {"plate_index": blind_index(plate)})
-
-    def _handle_open(self, payload):
-        envelope = payload.get("envelope")
-        identity = payload.get("identity")
-        requester = payload.get("requester")
-        if not isinstance(envelope, dict) or not isinstance(identity, dict):
-            return self._json(400, {"error": "envelope and identity are required"})
-
-        try:
-            result = STATE["custodian"].open(
-                envelope, identity, payload.get("statement"), payload.get("signature"),
-                requester, payload.get("presence"), payload.get("presence_proof"),
-                registry_versions=payload.get("registry_versions"),
-                blind_index_of=blind_index)
-        except custodian.AgreementUnavailable as exc:
-            # The key holder being unreachable is an operating state, not a
-            # fault, and never a reason to open anything another way.
-            STATE["record"]("agreement_unavailable", f"requester:{requester}",
-                            {"reason": str(exc)[:300]})
-            return self._json(503, {"error": str(exc)})
-        except custodian.CustodianError as exc:
-            STATE["record"]("open_refused", f"requester:{requester}", {
-                "reason": str(exc)[:300],
-                "record_uid": envelope.get("record_uid"),
-                "case": (payload.get("statement") or {}).get("case_number")
-                if isinstance(payload.get("statement"), dict) else None})
-            return self._json(403, {"error": str(exc)})
-
-        # Recorded before the response is written: an opening that reached the
-        # caller but not the ledger is exactly the gap that matters.
-        STATE["record"]("open_granted", f"requester:{requester}", {
-            "record_uid": envelope.get("record_uid"),
-            "authorization_id": (payload.get("statement") or {}).get("authorization_id"),
-            "approver": (payload.get("statement") or {}).get("approver"),
-            "use_count": result["use_count"], "presence": result["presence"],
-            "suite": result["suite"], "backend": result["backend"],
-            "context": result["context_digest"]})
-        # The plate never enters this ledger. Recording it here would rebuild
-        # the archive the custodian exists to protect.
-        return self._json(200, {"fields": result["fields"],
-                                "use_count": result["use_count"],
-                                "presence": result["presence"],
-                                "context": result["context_digest"]})
+        reply, status = dispatch(operation, payload)
+        self._json(status, reply)
 
 
 # ---------------------------------------------------------------------------
@@ -207,12 +246,16 @@ def build_agreement(args):
         except ImportError:
             raise SystemExit(
                 "--kms-key-arn needs boto3 installed in the custodian's environment")
-        recipient = enclave_decrypt = None
-        if args.attestation_file:
+        from justikey import enclave
+
+        attestation = None
+        if args.attest:
+            # Inside an enclave: a fresh recipient keypair per operation, with
+            # the NSM signing a document that carries its public key.
+            attestation = enclave.NsmAttestation()
+        elif args.attestation_file:
             with open(args.attestation_file, "rb") as fh:
-                recipient = {"AttestationDocument": fh.read(),
-                             "KeyEncryptionAlgorithm": "RSAES_OAEP_SHA_256"}
-            enclave_decrypt = _enclave_decrypt_unavailable
+                attestation = enclave.StaticAttestation(fh.read())
         if not args.public_key:
             raise SystemExit(
                 "--public-key is required with --kms-key-arn: the custodian must "
@@ -221,8 +264,7 @@ def build_agreement(args):
                 "correctness one")
         return custodian.KmsAgreement(
             boto3.client("kms", region_name=args.region), args.kms_key_arn,
-            bytes.fromhex(args.public_key), recipient=recipient,
-            enclave_decrypt=enclave_decrypt)
+            bytes.fromhex(args.public_key), attestation=attestation)
 
     material = args.key
     if not material and args.key_file:
@@ -234,21 +276,22 @@ def build_agreement(args):
     return custodian.LocalAgreement(private_hex, args.kem or kem_name)
 
 
-def _enclave_decrypt_unavailable(blob):
-    raise custodian.CustodianError(
-        "this build cannot decrypt CiphertextForRecipient: the enclave-side "
-        "decryption of the KMS response is not implemented here. Run the "
-        "custodian inside the enclave with a provider that can, or run without "
-        "--attestation-file and understand that the configuration does not "
-        "meet the stage 5 objective.")
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="JustiKey custodian: verifies the whole disclosure context, "
                     "then agrees exactly once")
+    parser.add_argument("--transport", choices=("http", "vsock"), default="http",
+                        help="http for development; vsock inside a Nitro enclave, "
+                             "which is the only channel an enclave has")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8091)
+    parser.add_argument("--vsock-cid", type=int, default=transport.VMADDR_CID_ANY,
+                        help="CID to bind; the default accepts from the parent")
+    parser.add_argument("--vsock-port", type=int, default=8091)
+    parser.add_argument("--max-connections", type=int,
+                        default=transport.DEFAULT_MAX_CONNECTIONS,
+                        help="concurrent connections; an enclave has a fixed "
+                             "memory allocation, so this is a refusal not a queue")
     parser.add_argument("--client-secret",
                         default=os.environ.get("JUSTIKEY_CUSTODIAN_CLIENT_SECRET"),
                         help="shared secret the disclosure service authenticates with")
@@ -272,8 +315,12 @@ def main():
     parser.add_argument("--region", default=os.environ.get("AWS_REGION"))
     parser.add_argument("--public-key", default=os.environ.get("JUSTIKEY_DISCLOSURE_PUBLIC_KEY"),
                         help="hex public key records are sealed to (with --kms-key-arn)")
+    parser.add_argument("--attest", action="store_true",
+                        help="request an attestation document from the NSM per "
+                             "KMS operation; requires running inside an enclave")
     parser.add_argument("--attestation-file",
-                        help="Nitro attestation document, sent to KMS as Recipient")
+                        help="a pre-obtained attestation document, for a deployment "
+                             "that gets one out of band")
     parser.add_argument("--key", help="software private key (development only)")
     parser.add_argument("--key-file", help="file holding a software private key")
     parser.add_argument("--kem", help="suite of the software key")
@@ -323,13 +370,28 @@ def main():
     })
 
     attested = bool(getattr(agreement, "meets_stage_5", False))
+
+    # A production invariant, enforced rather than documented: an attested
+    # custodian must not listen on TCP. A Nitro enclave has no external
+    # network and no persistent storage, and vsock is its only channel -- a
+    # TCP listener in that configuration either means this is not really an
+    # enclave, or means something has been arranged to reach it that should
+    # not exist. Refusing is cheaper than discovering which.
+    if attested and args.transport != "vsock":
+        print("\nRefusing to start: an attested custodian must serve on vsock, not "
+              "TCP.\nAn enclave's only channel is AF_VSOCK; a TCP listener here means "
+              "either\nthis is not an enclave, or something reaches it that should not.",
+              file=sys.stderr)
+        sys.exit(4)
     record("custodian_started", "custodian", {
         "backend": agreement.backend, "key_id": agreement.key_id,
         "kem": agreement.kem, "attested": attested,
         "presence_mode": args.presence_mode, "registry_versions": versions,
         "accepted_kems": list(STATE["custodian"].accepted_kems)})
 
-    print(f"JustiKey custodian on http://{args.host}:{args.port}")
+    where = (f"vsock cid={args.vsock_cid} port={args.vsock_port}"
+             if args.transport == "vsock" else f"http://{args.host}:{args.port}")
+    print(f"JustiKey custodian on {where}")
     print(f"  backend    : {agreement.backend}"
           f"{' (attested)' if attested else ''}")
     print(f"  key id     : {agreement.key_id}  [{agreement.kem}]")
@@ -343,13 +405,23 @@ def main():
         print("  credentials can make the same call to the key holder. See")
         print("  docs/stage-5-key-isolation.md.")
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    if args.transport == "vsock":
+        server = transport.VsockServer(
+            args.vsock_cid, args.vsock_port, dispatch,
+            max_connections=args.max_connections).bind()
+        record("listener_started", "custodian",
+               {"transport": "vsock", "cid": args.vsock_cid, "port": args.vsock_port})
+    else:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
+        if args.transport == "vsock":
+            server.shutdown()
+        else:
+            server.server_close()
 
 
 if __name__ == "__main__":

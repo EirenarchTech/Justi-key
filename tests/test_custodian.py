@@ -35,7 +35,8 @@ from justikey import (approvals, custodian, custody, db, disclosure, kem,  # noq
 
 SKIP = not sealing.SEALING_AVAILABLE
 if not SKIP:
-    from fake_kms import AccessDeniedException, FakeKms, image_sha384  # noqa: E402
+    from fake_kms import (AccessDeniedException, EnclaveAttestation,
+                          FakeKms, image_sha384)  # noqa: E402
 
 PLATE = "SECRET99"
 LOCATION = "Elm Street Depot"
@@ -129,8 +130,7 @@ class CustodianTest(unittest.TestCase):
     def agreement(self, attested=True, image=None):
         return custodian.KmsAgreement(
             self.kms, self.kms.key_arn, self.kms.public_raw,
-            recipient=FakeKms.attestation(image or self.image) if attested else None,
-            enclave_decrypt=FakeKms.enclave_decrypt if attested else None)
+            attestation=EnclaveAttestation(image or self.image) if attested else None)
 
     def custodian(self, attested=True, image=None, registry_versions=None, **kwargs):
         return custodian.Custodian(
@@ -266,24 +266,30 @@ class TestAttestation(CustodianTest):
         self.assertIn("revoked", str(caught.exception))
 
     def test_an_attested_call_never_returns_a_plaintext_secret_to_the_parent(self):
+        from justikey import enclave
+
+        key = enclave.RecipientKey()
         response = self.kms.derive_shared_secret(
             KeyId=self.kms.key_arn, KeyAgreementAlgorithm="ECDH",
             PublicKey=custodian._spki(kem.P256Suite.generate()[1]),
-            Recipient=FakeKms.attestation(self.image))
+            Recipient=FakeKms.attestation(self.image, key.public_der))
         self.assertEqual(response["SharedSecret"], b"")
         self.assertTrue(response["CiphertextForRecipient"])
+        # And what comes back is openable only by the key the document named.
+        self.assertEqual(len(key.decrypt(response["CiphertextForRecipient"])), 32)
+        with self.assertRaises(enclave.EnclaveError):
+            enclave.RecipientKey().decrypt(response["CiphertextForRecipient"])
 
     def test_a_backend_returning_a_plaintext_secret_on_an_attested_call_is_refused(self):
         """If the attested path ever hands the parent a usable secret, that is
         not the attested path and must not be trusted."""
         class Leaky:
             def derive_shared_secret(self, **kwargs):
-                return {"SharedSecret": b"x" * 32, "CiphertextForRecipient": b"for-enclave:00"}
+                return {"SharedSecret": b"x" * 32, "CiphertextForRecipient": b"anything"}
 
         agreement = custodian.KmsAgreement(
             Leaky(), self.kms.key_arn, self.kms.public_raw,
-            recipient=FakeKms.attestation(self.image),
-            enclave_decrypt=FakeKms.enclave_decrypt)
+            attestation=EnclaveAttestation(self.image))
         with self.assertRaises(custodian.CustodianError) as caught:
             agreement.agree(kem.P256Suite.generate()[1])
         self.assertIn("not the attested path", str(caught.exception))
@@ -483,8 +489,7 @@ class TestFailClosed(CustodianTest):
 
         agreement = custodian.KmsAgreement(
             Unreachable(), self.kms.key_arn, self.kms.public_raw,
-            recipient=FakeKms.attestation(self.image),
-            enclave_decrypt=FakeKms.enclave_decrypt)
+            attestation=EnclaveAttestation(self.image))
         instance = custodian.Custodian(
             agreement, approvers=disclosure.local_approver_registry(self.conn),
             requesters=disclosure.local_requester_registry(self.conn),
@@ -493,6 +498,9 @@ class TestFailClosed(CustodianTest):
             self.open_it(custodian_=instance)
 
     def test_a_recipient_without_a_way_to_decrypt_is_a_refusal_not_a_fallback(self):
+        """A static recipient with no decryptor and no attestation provider
+        cannot use what KMS returns, so it is a construction-time error rather
+        than a silent fall back to an unattested call."""
         with self.assertRaises(custodian.CustodianError) as caught:
             custodian.KmsAgreement(self.kms, self.kms.key_arn, self.kms.public_raw,
                                    recipient=FakeKms.attestation(self.image))

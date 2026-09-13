@@ -30,7 +30,7 @@ from justikey import (approvals, config, custodian, custody, db, disclosure,  # 
 
 SKIP = not sealing.SEALING_AVAILABLE
 if not SKIP:
-    from fake_kms import FakeKms, image_sha384  # noqa: E402
+    from fake_kms import EnclaveAttestation, FakeKms, image_sha384  # noqa: E402
 
 PLATE = "SECRET99"
 LOCATION = "Elm Street Depot"
@@ -122,8 +122,7 @@ class CustodianProcessTest(unittest.TestCase):
 
         agreement = custodian.KmsAgreement(
             self.kms, self.kms.key_arn, self.kms.public_raw,
-            recipient=FakeKms.attestation(self.image) if attested else None,
-            enclave_decrypt=FakeKms.enclave_decrypt if attested else None)
+            attestation=EnclaveAttestation(self.image) if attested else None)
         usage = disclosure.UsageStore(self.ledger)
 
         self._saved_state = dict(self.module.STATE)
@@ -327,7 +326,8 @@ class TestTheArchiveAcrossTheBoundary(CustodianProcessTest):
         self.assertEqual(len(rows), len(self.plates))
 
         client = custodian.RemoteCustodian(
-            f"http://127.0.0.1:{self.port}", "disclosure-service", self.secret)
+            url=f"http://127.0.0.1:{self.port}", client_id="disclosure-service",
+            client_secret=self.secret)
         opened = []
         for row in rows:
             proof_statement, proof = self.proof(statement)
@@ -348,7 +348,8 @@ class TestTheArchiveAcrossTheBoundary(CustodianProcessTest):
         rows = [dict(r) for r in self.conn.execute(
             "SELECT * FROM lpr_events ORDER BY id")]
         client = custodian.RemoteCustodian(
-            f"http://127.0.0.1:{self.port}", "disclosure-service", self.secret)
+            url=f"http://127.0.0.1:{self.port}", client_id="disclosure-service",
+            client_secret=self.secret)
         for row in rows:
             proof_statement, proof = self.proof(statement)
             identity = {k: row[k] for k in
@@ -457,6 +458,104 @@ class TestTheApplicationHoldsNoIndexKey(CustodianProcessTest):
         self.assertIsInstance(client, custodian.RemoteCustodian)
 
 
+class TestFramedTransportAttacks(CustodianProcessTest):
+    """The remaining vsock-specific attacks, against a live custodian.
+
+    Driven through the same dispatch the vsock server calls, so what is
+    exercised is the custodian's behaviour rather than HTTP's.
+    """
+
+    def framed(self, operation, payload):
+        """One request through transport.serve_connection over a socketpair."""
+        import socket
+        import threading as _threading
+
+        from justikey import transport as _transport
+
+        client, server = socket.socketpair()
+        self.addCleanup(client.close)
+        self.addCleanup(server.close)
+        thread = _threading.Thread(
+            target=_transport.serve_connection,
+            args=(server, self.module.dispatch), daemon=True)
+        thread.start()
+        _transport.write_frame(client, operation, payload)
+        client.settimeout(10)
+        try:
+            return _transport.read_frame(client)
+        finally:
+            thread.join(timeout=10)
+
+    def open_payload(self, row, statement, signature, proof_statement, proof):
+        return {"envelope": {k: row.get(k) for k in custodian.ENVELOPE_FIELDS},
+                "identity": {k: row[k] for k in
+                             ("record_uid", "captured_at", "camera_id", "plate_index")},
+                "statement": statement, "signature": signature,
+                "requester": "officer1", "presence": proof_statement,
+                "presence_proof": proof,
+                "registry_versions": self.versions()}
+
+    def test_a_completed_open_frame_replayed_verbatim_is_refused(self):
+        """Attack 3: the whole frame, byte for byte, sent twice."""
+        statement, signature = self.statement_for()
+        proof_statement, proof = self.proof(statement)
+        row = dict(self.conn.execute(
+            "SELECT * FROM lpr_events WHERE id=?",
+            (self.record_ids[PLATE],)).fetchone())
+        payload = self.open_payload(row, statement, signature, proof_statement, proof)
+
+        reply_op, reply = self.framed("open", payload)
+        self.assertEqual(reply_op, "ok", reply)
+        self.assertEqual(reply["fields"]["plate"], PLATE)
+
+        reply_op, reply = self.framed("open", payload)
+        self.assertEqual(reply_op, "error")
+        self.assertIn("already been used", reply["error"])
+
+    def test_a_stale_ciphertext_for_recipient_cannot_be_reused(self):
+        """Attack 5: a KMS response captured from an earlier operation.
+
+        A fresh recipient keypair per operation is what makes this detectable:
+        the attestation document names the key KMS encrypts to, so a response
+        produced for one operation cannot be opened by the next one. Simulated
+        by having the attestation name a stale public key.
+        """
+        from justikey import enclave
+
+        stale = enclave.RecipientKey()
+        agreement = custodian.KmsAgreement(
+            self.kms, self.kms.key_arn, self.kms.public_raw,
+            attestation=EnclaveAttestation(self.image,
+                                           override_public_der=stale.public_der))
+        self.module.STATE["custodian"].agreement = agreement
+
+        statement, signature = self.statement_for()
+        proof_statement, proof = self.proof(statement)
+        row = dict(self.conn.execute(
+            "SELECT * FROM lpr_events WHERE id=?",
+            (self.record_ids[PLATE],)).fetchone())
+        reply_op, reply = self.framed(
+            "open", self.open_payload(row, statement, signature, proof_statement, proof))
+        self.assertEqual(reply_op, "error")
+        self.assertIn("not encrypted to this operation's recipient key", reply["error"])
+
+    def test_the_archive_attack_gives_the_same_answer_over_the_framed_path(self):
+        """Changing transport must not move record selection out of the
+        custodian. Same attack, same answer, different wire."""
+        statement, signature = self.statement_for()
+        rows = [dict(r) for r in self.conn.execute(
+            "SELECT * FROM lpr_events ORDER BY id")]
+        opened = []
+        for row in rows:
+            proof_statement, proof = self.proof(statement)
+            reply_op, reply = self.framed(
+                "open",
+                self.open_payload(row, statement, signature, proof_statement, proof))
+            if reply_op == "ok":
+                opened.append(reply["fields"]["plate"])
+        self.assertEqual(opened, [PLATE])
+
+
 class TestFailsClosed(CustodianProcessTest):
     def test_an_unreachable_custodian_opens_nothing(self):
         statement, signature = self.statement_for()
@@ -476,8 +575,7 @@ class TestFailsClosed(CustodianProcessTest):
 
         self.module.STATE["custodian"].agreement = custodian.KmsAgreement(
             Unreachable(), self.kms.key_arn, self.kms.public_raw,
-            recipient=FakeKms.attestation(self.image),
-            enclave_decrypt=FakeKms.enclave_decrypt)
+            attestation=EnclaveAttestation(self.image))
 
         statement, signature = self.statement_for()
         proof_statement, proof = self.proof(statement)

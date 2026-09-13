@@ -41,13 +41,22 @@ tests, and as the reference the hardware path is checked against; it does not
 meet the stage 5 objective and says so.
 
 `KmsAgreement` calls AWS KMS `DeriveSharedSecret` on an `ECC_NIST_P256` key
-created with `KeyUsage=KEY_AGREEMENT`. With `recipient` set it uses Nitro
-attestation: KMS then encrypts the derived secret to the attested enclave and
-returns an empty `SharedSecret` to the caller, and the KMS key policy can
-require a specific enclave measurement
-(`kms:RecipientAttestation:ImageSha384` / PCRs). A call from a compromised
-parent process, without a matching attestation document, is refused by KMS
-itself rather than by anything in this file.
+created with `KeyUsage=KEY_AGREEMENT`. With an attestation provider set it
+runs the hardened Nitro sequence, per operation:
+
+    1. generate an RSA-2048 recipient keypair inside the enclave
+    2. ask the NSM for an attestation document carrying its public key
+    3. call DeriveSharedSecret with the record's ephemeral P-256 key and
+       Recipient = that document
+    4. require CiphertextForRecipient non-empty AND SharedSecret empty
+    5. decrypt the CMS envelope with the recipient private key
+    6. HKDF, then AEAD open, erasing what can be erased
+
+The KMS key policy can require a specific enclave measurement
+(`kms:RecipientAttestation:ImageSha384` / PCRs), so a call from a compromised
+parent process without a matching attestation document is refused by KMS
+itself rather than by anything in this file. The NSM signs the attestation
+document; it does not decrypt anything -- see justikey/enclave.py.
 
 That last point is the one worth being careful about: it is the only control
 here that does not depend on this code being correct.
@@ -72,6 +81,12 @@ class AgreementUnavailable(CustodianError):
 # Client: the disclosure service's view of a custodian in another process
 # ---------------------------------------------------------------------------
 
+# Operations the custodian offers. Anything else is refused by name, at the
+# boundary, before a handler sees it -- the oracle restated as an operation
+# is exactly what stage 5 removes.
+OPERATIONS = ("index", "open")
+
+
 class RemoteCustodian:
     """Calls a custodian running as its own process and principal.
 
@@ -86,64 +101,50 @@ class RemoteCustodian:
     itself -- so a compromised disclosure service gains nothing by lying here.
     """
 
-    def __init__(self, url, client_id, client_secret, timeout=None):
-        from . import config
+    def __init__(self, transport=None, url=None, client_id=None,
+                 client_secret=None, timeout=None):
+        """Takes a transport, or builds an HTTP one from a URL.
 
-        self.url = url.rstrip("/")
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.timeout = timeout or config.DISCLOSURE_TIMEOUT_SECONDS
+        The transport decides framing and isolation and nothing else. Swapping
+        HTTP for vsock must not change a single authorization decision, which
+        is why the checks all live on the far side of it.
+        """
+        from . import transport as _transport
+
+        if transport is None:
+            if not url:
+                raise CustodianError("a custodian needs a transport or a URL")
+            transport = _transport.HttpTransport(url, client_id, client_secret, timeout)
+        self.transport = transport
         self._key_info = None
 
-    def _post(self, path, payload):
-        import json as _json
-        import secrets
-        from urllib import error, request
+    def _call(self, operation, payload):
+        from . import transport as _transport
 
-        from . import servicekit
-
-        body = _json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        timestamp, nonce = timeutil.now_iso(), secrets.token_urlsafe(16)
-        req = request.Request(self.url + path, data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("X-JustiKey-Client-Id", self.client_id)
-        req.add_header("X-JustiKey-Timestamp", timestamp)
-        req.add_header("X-JustiKey-Nonce", nonce)
-        req.add_header("X-JustiKey-Signature",
-                       servicekit.request_signature(self.client_secret, timestamp,
-                                                    nonce, body))
         try:
-            with request.urlopen(req, timeout=self.timeout) as response:
-                return _json.loads(response.read().decode("utf-8"))
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:300]
-            if exc.code == 503:
-                raise AgreementUnavailable(
-                    f"the custodian could not reach its key holder: {detail}") from exc
-            raise CustodianError(f"the custodian refused ({exc.code}): {detail}") from exc
-        except (error.URLError, OSError, ValueError) as exc:
+            reply, status = self.transport.request(operation, payload)
+        except _transport.TransportError as exc:
             # Unreachable is a clean refusal, never "open it anyway".
-            raise AgreementUnavailable(f"custodian unreachable: {exc!r}") from exc
+            raise AgreementUnavailable(f"custodian unreachable: {exc}") from exc
+        if status == 200:
+            return reply
+        detail = str(reply.get("error", reply))[:300]
+        if status == 503:
+            raise AgreementUnavailable(
+                f"the custodian could not reach its key holder: {detail}")
+        raise CustodianError(f"the custodian refused ({status}): {detail}")
 
     def key_info(self):
         if self._key_info is None:
-            import json as _json
-            from urllib import error, request
-
-            try:
-                with request.urlopen(self.url + "/publickey", timeout=self.timeout) as r:
-                    self._key_info = _json.loads(r.read().decode("utf-8"))
-            except (error.URLError, OSError, ValueError) as exc:
-                raise AgreementUnavailable(
-                    f"could not reach the custodian at {self.url}: {exc!r}") from exc
+            self._key_info = self._call("publickey", {})
         return self._key_info
 
     def blind_index(self, plate):
-        return self._post("/index", {"plate": plate})["plate_index"]
+        return self._call("index", {"plate": plate})["plate_index"]
 
     def open(self, envelope, identity, statement, signature, requester,
              proof_statement=None, proof=None, registry_versions=None):
-        return self._post("/open", {
+        return self._call("open", {
             "envelope": {k: envelope.get(k) for k in ENVELOPE_FIELDS},
             "identity": identity,
             "statement": statement,
@@ -205,13 +206,14 @@ class KmsAgreement:
     backend = "aws-kms"
 
     def __init__(self, client, key_arn, public_raw, kem_name=None,
-                 recipient=None, enclave_decrypt=None, legacy_key_id=None):
+                 recipient=None, enclave_decrypt=None, legacy_key_id=None,
+                 attestation=None):
         self.kem = kem_name or kem.P256_ECDH
         if self.kem != kem.P256_ECDH:
             raise CustodianError(
                 f"AWS KMS key agreement is NIST ECC only; {self.kem!r} is not "
                 f"available. See docs/stage-5-key-isolation.md.")
-        if recipient is not None and enclave_decrypt is None:
+        if recipient is not None and enclave_decrypt is None and attestation is None:
             raise CustodianError(
                 "a recipient attestation was configured but no way to decrypt "
                 "for it: KMS will return an empty SharedSecret and nothing here "
@@ -219,6 +221,11 @@ class KmsAgreement:
         self._client = client
         self._recipient = recipient
         self._enclave_decrypt = enclave_decrypt
+        # The hardened path: an attestation provider mints a FRESH recipient
+        # keypair per operation and asks for a document carrying its public
+        # key. A captured CiphertextForRecipient is then useless outside the
+        # single operation that requested it.
+        self._attestation = attestation
         self.key_arn = key_arn
         self.public_raw = public_raw
         self.key_id = kem.key_id(self.kem, public_raw)
@@ -226,7 +233,7 @@ class KmsAgreement:
         # Attested calls are the only configuration that meets the objective:
         # without one, a compromised parent holding the same IAM credentials
         # can make the same call.
-        self.meets_stage_5 = recipient is not None
+        self.meets_stage_5 = recipient is not None or attestation is not None
 
     def accepts(self, recipient_key_id):
         return recipient_key_id in (self.key_id, self.legacy_key_id)
@@ -242,15 +249,26 @@ class KmsAgreement:
             "KeyAgreementAlgorithm": "ECDH",
             "PublicKey": _spki(peer_public_raw),
         }
-        if self._recipient is not None:
-            request["Recipient"] = self._recipient
+        # A recipient key that exists only for this call.
+        recipient, recipient_key = self._recipient, None
+        if self._attestation is not None:
+            from . import enclave
+
+            try:
+                recipient, recipient_key = enclave.recipient_for(self._attestation)
+            except enclave.EnclaveError as exc:
+                raise AgreementUnavailable(
+                    f"could not prepare an attested request: {exc}") from exc
+        if recipient is not None:
+            request["Recipient"] = recipient
+
         try:
             response = self._client.derive_shared_secret(**request)
         except Exception as exc:  # noqa: BLE001 - includes AccessDenied
             raise AgreementUnavailable(
                 f"the key custodian refused or could not be reached: {exc}") from exc
 
-        if self._recipient is not None:
+        if recipient is not None:
             blob = response.get("CiphertextForRecipient")
             if not blob:
                 raise CustodianError(
@@ -263,6 +281,19 @@ class KmsAgreement:
                 raise CustodianError(
                     "an attested agreement also returned a plaintext shared secret; "
                     "this is not the attested path and must not be trusted")
+            if recipient_key is not None:
+                from . import enclave
+
+                try:
+                    return recipient_key.decrypt(blob)
+                except enclave.EnclaveError as exc:
+                    # A response encrypted to some other enclave's key, or to
+                    # an earlier operation's key, lands here. Binding the
+                    # recipient key to one operation is what makes that
+                    # detectable rather than merely unlikely.
+                    raise CustodianError(
+                        f"the KMS response was not encrypted to this operation's "
+                        f"recipient key: {exc}") from exc
             return self._enclave_decrypt(blob)
 
         secret = response.get("SharedSecret")

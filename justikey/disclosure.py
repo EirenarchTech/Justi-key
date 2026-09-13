@@ -727,8 +727,8 @@ def service_for(conn, db_path):
                 "a custodian is configured but no client secret is set; "
                 "set JUSTIKEY_CUSTODIAN_CLIENT_SECRET")
         client = _custodian.RemoteCustodian(
-            config.CUSTODIAN_URL, config.CUSTODIAN_CLIENT_ID,
-            config.CUSTODIAN_CLIENT_SECRET)
+            url=config.CUSTODIAN_URL, client_id=config.CUSTODIAN_CLIENT_ID,
+            client_secret=config.CUSTODIAN_CLIENT_SECRET)
         info = client.key_info()
         return DisclosureService(
             _PublicOnlyOpener(info["public_key"], info["kem"]), None,
@@ -764,8 +764,8 @@ def index_client():
                 "a custodian is configured but no client secret is set; "
                 "set JUSTIKEY_CUSTODIAN_CLIENT_SECRET")
         return _custodian.RemoteCustodian(
-            config.CUSTODIAN_URL, config.CUSTODIAN_CLIENT_ID,
-            config.CUSTODIAN_CLIENT_SECRET)
+            url=config.CUSTODIAN_URL, client_id=config.CUSTODIAN_CLIENT_ID,
+            client_secret=config.CUSTODIAN_CLIENT_SECRET)
     return remote_client()
 
 

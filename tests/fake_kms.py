@@ -18,6 +18,7 @@ does, and the tests here prove JustiKey behaves correctly *given* that. The
 boundary between the two is stated in docs/stage-5-key-isolation.md.
 """
 import hashlib
+import json
 import os
 import sys
 
@@ -45,18 +46,19 @@ class FakeKms:
     # -- enclave side ------------------------------------------------------
 
     @staticmethod
-    def attestation(image_sha384):
-        """What an enclave presents. Real documents are CBOR/COSE; the only
-        property under test here is which image made the call."""
-        return {"AttestationDocument": image_sha384.encode("utf-8"),
-                "KeyEncryptionAlgorithm": "RSAES_OAEP_SHA_256"}
+    def attestation(image_sha384, public_der=None):
+        """What an enclave presents.
 
-    @staticmethod
-    def enclave_decrypt(blob):
-        """Stands in for decrypting CiphertextForRecipient inside the enclave."""
-        if not blob.startswith(b"for-enclave:"):
-            raise ValueError("not a ciphertext for this enclave")
-        return bytes.fromhex(blob[len(b"for-enclave:"):].decode("ascii"))
+        A real document is CBOR/COSE signed by the NSM, carrying the
+        enclave's PCRs and the recipient public key. Here it is the image
+        measurement plus that public key, because those are the two
+        properties the tests actually exercise: which image called, and which
+        key KMS must encrypt to.
+        """
+        document = {"image": image_sha384,
+                    "public_key": (public_der or b"").hex()}
+        return {"AttestationDocument": json.dumps(document).encode("utf-8"),
+                "KeyEncryptionAlgorithm": "RSAES_OAEP_SHA_256"}
 
     # -- the KMS operation -------------------------------------------------
 
@@ -69,9 +71,19 @@ class FakeKms:
             raise AccessDeniedException(
                 f"unsupported key agreement algorithm {KeyAgreementAlgorithm!r}")
 
-        image = None
+        image, recipient_public = None, None
         if Recipient is not None:
-            image = Recipient["AttestationDocument"].decode("utf-8")
+            try:
+                document = json.loads(Recipient["AttestationDocument"].decode("utf-8"))
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise AccessDeniedException(
+                    f"AccessDeniedException: malformed attestation document: {exc}")
+            image = document.get("image")
+            recipient_public = bytes.fromhex(document.get("public_key") or "")
+            if Recipient.get("KeyEncryptionAlgorithm") != "RSAES_OAEP_SHA_256":
+                raise AccessDeniedException(
+                    "AccessDeniedException: RSAES_OAEP_SHA_256 is the only key "
+                    "encryption algorithm supported for Nitro Enclaves")
             if image in self.revoked_images:
                 raise AccessDeniedException(
                     "AccessDeniedException: the attested image has been revoked")
@@ -92,9 +104,14 @@ class FakeKms:
         secret = self._private.exchange(_ecdh(), peer)
 
         if Recipient is not None:
-            # KMS encrypts to the enclave and returns no plaintext secret.
+            # KMS re-encrypts to the public key in the attestation document
+            # and returns NO plaintext secret.
+            if not recipient_public:
+                raise AccessDeniedException(
+                    "AccessDeniedException: the attestation document carries no "
+                    "public key to encrypt the result to")
             return {"SharedSecret": b"",
-                    "CiphertextForRecipient": b"for-enclave:" + secret.hex().encode("ascii"),
+                    "CiphertextForRecipient": cms_envelope(recipient_public, secret),
                     "KeyId": KeyId}
         return {"SharedSecret": secret, "KeyId": KeyId}
 
@@ -112,5 +129,88 @@ def _from_spki(der):
     return der[len(prefix):]
 
 
+class EnclaveAttestation:
+    """Stands in for the NSM.
+
+    Produces a document carrying the per-operation recipient public key,
+    which is the property the hardened sequence depends on: KMS encrypts to
+    whatever key the document names, so a document naming a stale key makes
+    the response undecryptable by the operation that asked for it.
+    """
+
+    available = True
+
+    def __init__(self, image, override_public_der=None):
+        self.image = image
+        # For the test that feeds a later operation an older ciphertext.
+        self.override_public_der = override_public_der
+        self.documents = []
+
+    def document_for(self, public_der):
+        used = self.override_public_der or public_der
+        self.documents.append(used)
+        return FakeKms.attestation(self.image, used)["AttestationDocument"]
+
+
 def image_sha384(label):
     return hashlib.sha384(label.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Genuine RFC 5652 EnvelopedData
+# ---------------------------------------------------------------------------
+#
+# Produced properly rather than faked, so justikey/enclave.py's parser is
+# exercised against the format AWS actually returns. A stand-in that emitted
+# a bare RSA-OAEP blob would let a parser pass here and fail against KMS,
+# which is the exact class of bug a stand-in is supposed to prevent.
+
+def _der(tag, content):
+    if len(content) < 0x80:
+        return bytes([tag, len(content)]) + content
+    length = len(content).to_bytes((len(content).bit_length() + 7) // 8, "big")
+    return bytes([tag, 0x80 | len(length)]) + length + content
+
+
+def _oid(content_octets):
+    return _der(0x06, content_octets)
+
+
+def cms_envelope(recipient_public_der, plaintext):
+    """EnvelopedData: RSA-OAEP-SHA256 over the content key, AES-256-CBC content."""
+    import os as _os
+
+    from cryptography.hazmat.primitives import hashes, padding as sym_padding
+    from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.serialization import load_der_public_key
+
+    from justikey import enclave
+
+    content_key, iv = _os.urandom(32), _os.urandom(16)
+    padder = sym_padding.PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(content_key), modes.CBC(iv)).encryptor()
+    encrypted_content = encryptor.update(padded) + encryptor.finalize()
+
+    public = load_der_public_key(recipient_public_der)
+    encrypted_key = public.encrypt(
+        content_key,
+        asym_padding.OAEP(mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+                          algorithm=hashes.SHA256(), label=None))
+
+    ktri = _der(0x30,
+                _der(0x02, b"\x00")                       # version
+                + _der(0x80, b"\x01\x02\x03\x04")         # rid (subjectKeyIdentifier)
+                + _der(0x30, _oid(enclave.OID_RSAES_OAEP))  # keyEncryptionAlgorithm
+                + _der(0x04, encrypted_key))
+    encrypted_content_info = _der(
+        0x30,
+        _oid(enclave.OID_DATA)
+        + _der(0x30, _oid(enclave.OID_AES_256_CBC) + _der(0x04, iv))
+        + _der(0x80, encrypted_content))                   # [0] IMPLICIT
+    enveloped = _der(0x30,
+                     _der(0x02, b"\x00")
+                     + _der(0x31, ktri)
+                     + encrypted_content_info)
+    return _der(0x30, _oid(enclave.OID_ENVELOPED_DATA) + _der(0xA0, enveloped))

@@ -123,6 +123,7 @@ scripts/
   manage_keys.py    enrol hardware authenticators; export the service registries
   disclosure_server.py the disclosure service, as its own process and principal
   custodian_server.py  the custodian: verifies the whole context, then agrees once
+                       (--transport vsock inside a Nitro enclave)
   verify_audit.py   independent verifier: chain + anchors + witness
 
 tests/
@@ -622,10 +623,59 @@ unattested custodian prints a startup notice saying plainly that the
 configuration does not meet the objective — a development setup should not be
 able to pass for a production one.
 
-**Not built:** enclave-side decryption of `CiphertextForRecipient` needs the
-NSM device, so outside an enclave it is a named refusal rather than a stub; a
-vsock transport to replace TCP; and the AWS behaviour is exercised against a
-stand-in implementing the documented policy semantics, not against AWS. See
+### Transport: vsock in production
+
+```
+CustodianClient
+    ├── HttpTransport     development and process tests
+    └── VsockTransport    Nitro production
+```
+
+vsock is the only channel between an enclave and its parent, and the enclave
+has no external network and no persistent storage. That is real isolation —
+and **not** authorization: once the parent is in the threat model it holds
+whatever transport credential the parent holds, and a CID only says which
+side of a socket someone is on. Authorization stays entirely with the
+approver signature, the presence proof, scope, registry versions, nonce and
+cap state, and record identity.
+
+The transport owns framing: a length prefix with a ceiling checked *before*
+allocation, read deadlines, bounded concurrency (a refusal, not a queue), one
+request per connection, and unknown fields refused rather than ignored. Both
+transports call one dispatch function, so they cannot drift in what they
+accept.
+
+**An attested custodian refuses to start a TCP listener** and exits 4 —
+tested as a real subprocess. Development may use HTTP; it just may not claim
+to be attested.
+
+| vsock attack | Result |
+|---|---|
+| `derive` / `agree` / `unwrap` / `decrypt` | refused: unknown operation |
+| `open` with multiple records | refused: exactly one record |
+| completed `open` frame replayed verbatim | refused: proof already used |
+| oversized / truncated / malformed frames | refused before allocation; no hang |
+| stale `CiphertextForRecipient` reused | refused: not this operation's key |
+
+The archive attack re-run over the framed path gives the same answer as over
+HTTP — swapping transport must not move record selection out of the
+custodian.
+
+### The recipient path
+
+The NSM signs the attestation document; it does **not** decrypt anything. The
+enclave generates an RSA-2048 keypair per KMS operation, the NSM attests to
+its public key, KMS encrypts the secret to it and returns an empty
+`SharedSecret`, and the enclave decrypts with a private key that never left
+its memory. `CiphertextForRecipient` is a CMS `EnvelopedData` (RFC 5652) —
+RSA-OAEP-SHA-256 over a content key, AES-256-CBC content — and the stand-in
+produces genuine DER so the parser is tested against the real format.
+
+**Not built:** the NSM attestation request needs the device; the vsock round
+trip needs a kernel with vsock routing (this one binds listeners but has no
+`vsock_loopback`); the KMS behaviour is exercised against a stand-in
+implementing the documented policy semantics, not against AWS. Each is a
+named refusal or a stated gap rather than a stub. See
 [stage-5-key-isolation.md](docs/stage-5-key-isolation.md).
 
 ## Limits enforced in software, not policy
