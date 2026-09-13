@@ -123,6 +123,15 @@ the KMS key policy pins.**
 > image by digest and record the EIF's own SHA-256 alongside the PCRs, or the
 > next rebuild will not match the key policy and you will not know why.
 
+> **Never run the acceptance gates against a debug enclave.** An enclave
+> started with `--debug-mode` or `--attach-console` produces attestation
+> documents whose PCRs are **entirely zeroes**, and those documents cannot be
+> used for cryptographic attestation at all. A gate run against a debug
+> enclave tells you nothing about the enclave you will deploy — and because
+> such a call fails, it can look like a passing "denied" result when it is
+> really "this was never a real attestation". Gate 1 below records the
+> launch flags for exactly this reason.
+
 ---
 
 ## 3. The KMS key
@@ -190,22 +199,102 @@ This is the control that does not depend on JustiKey's code being correct.
 }
 ```
 
-Three things about this policy are deliberate:
+Two things about this policy are deliberate:
 
 - **`kms:DeriveSharedSecret` is the only cryptographic action granted.** Not
   `kms:*`. The key can agree and do nothing else.
 - **The condition applies to the parent's role**, which is the principal that
   signs the request — the attestation document is what distinguishes an
   enclave call from a parent call using the same credentials.
-- **The administrator statement grants no cryptographic use.** Whoever can
-  change the policy cannot use the key; whoever can use the key cannot change
-  the policy. If one role held both, pinning the measurement would be
-  advisory.
 
 > **The default key policy will undo this.** If you create the key without
 > `--policy`, AWS attaches a default that grants the account root full
 > access, and the attestation condition becomes decoration. Create it with
 > the policy, and check with `aws kms get-key-policy` afterwards.
+
+### The administration boundary is not in this policy
+
+An earlier draft of this runbook said the administrator statement "grants no
+cryptographic use", and concluded that whoever can change the policy cannot
+use the key. **That is wrong**, and wrong in a way worth being precise about.
+
+`kms:PutKeyPolicy` is a path to future cryptographic access. A principal that
+can rewrite the key policy can write itself a new one — granting
+`kms:DeriveSharedSecret` with no attestation condition, and then use the key.
+Omitting `DeriveSharedSecret` from the admin role's *present* permissions is
+good least privilege; it is not a separation of duties, because the admin
+role can grant it to itself at any time. Any control expressed only inside
+the document a principal can rewrite is a control that principal holds.
+
+Making the separation real requires something the key-policy holder cannot
+edit:
+
+- **Deny `kms:PutKeyPolicy` on this key in a Service Control Policy**, or
+  equivalent independent IAM governance, so the prohibition lives above the
+  account rather than inside it.
+
+  ```json
+  {
+    "Sid": "NoPolicyEditsOnTheCustodianKey",
+    "Effect": "Deny",
+    "Action": ["kms:PutKeyPolicy", "kms:ScheduleKeyDeletion"],
+    "Resource": "arn:aws:kms:REGION:ACCOUNT:key/KEY_ID",
+    "Condition": {
+      "ArnNotEquals": {
+        "aws:PrincipalArn": "arn:aws:iam::ACCOUNT:role/justikey-break-glass"
+      }
+    }
+  }
+  ```
+
+- **Alarm on `PutKeyPolicy` for this key**, not merely log it. A CloudTrail
+  event nobody reads is not a control. A policy change on the custodian key
+  should page someone, because the legitimate rate is a few times a year.
+
+- **Record the policy's digest** alongside the PCRs (gate 1), so a change is
+  detectable by comparison rather than by noticing.
+
+This is the same shape as the registry-integrity control in
+[threat-model.md](threat-model.md) finding 8, and it has the same honest
+limit: it is detection and constraint, not prevention. An organization
+administrator who can edit the SCP is above all of this. What it buys is that
+changing who may use the archive's key stops being a single principal's
+routine action.
+
+### Choosing what to pin
+
+For this first acceptance deployment, pin the **exact build**: `ImageSha384`
+(PCR0), `PCR1` and `PCR2`, as in the policy above. It gives the cleanest
+possible answer to the one question the deployment exists to answer — *does
+this exact enclave build get access, while anything altered does not?* — and
+an experiment with one variable is worth more than a flexible configuration.
+
+| PCR | Measures |
+|---|---|
+| PCR0 (`ImageSha384`) | the enclave image file |
+| PCR1 | Linux kernel and bootstrap |
+| PCR2 | the application |
+| PCR3 | the IAM role attached to the parent instance |
+| PCR4 | the parent instance ID |
+| PCR8 | the EIF signing certificate |
+
+For later operational deployments, move to **signed EIFs with PCR8 + PCR3**,
+which AWS recommends together for flexibility. A controlled signer can then
+authorise a new image without every legitimate rebuild becoming an emergency
+KMS-policy edit — which matters, because a process that makes routine
+rebuilds painful is a process that eventually gets a standing exception.
+
+PCR3 is not emitted by the build; derive it from the parent's role ARN:
+
+```bash
+ROLEARN="arn:aws:iam::ACCOUNT:role/justikey-custodian-parent"
+python3 -c "import hashlib; h=hashlib.sha384(); h.update(b'\0'*48); \
+h.update('$ROLEARN'.encode()); print(h.hexdigest())"
+```
+
+PCR8 appears in `build-enclave` output only when `--private-key` and
+`--signing-certificate` are given. **Do not make that change before the first
+acceptance run.**
 
 ---
 
@@ -268,52 +357,155 @@ python3 scripts/run_server.py
 
 ---
 
-## 6. Acceptance gates
+## 6. The acceptance suite
 
-**Do not put real plate data behind this until every gate passes.** Each one
-is a distinct failure mode; a deployment that passes nine of ten is not 90%
-secure, it has one specific hole.
+Run one deliberately tiny system. Small enough that every result is
+unambiguous, and cheap enough to throw away and rebuild when a gate fails:
 
-| # | Gate | How to check | Expected |
+```
+1 Nitro-capable EC2 parent      1 P-256 KEY_AGREEMENT KMS key
+1 EIF (not debug mode)          1 test archive, 10-25 v4 records
+1 approver                      1 requester
+```
+
+**Do not put real plate data behind this until every gate passes.** A
+deployment that passes eleven of twelve is not 92% secure; it has one
+specific hole, and you now know which.
+
+Run them in this order. The order matters: each one establishes a fact the
+next depends on.
+
+| # | Test | Expected | Evidence |
 |---|---|---|---|
-| 1 | EIF built and PCRs recorded | `nitro-cli build-enclave` output saved with the EIF's SHA-256 | PCR0/1/2 recorded, rebuild reproduces them |
-| 2 | KMS policy pinned to the measurement | `aws kms get-key-policy` | condition present; no default policy granting root `kms:*` |
-| 3 | Approved EIF succeeds | run a real disclosure end to end | record opens |
-| 4 | Modified EIF denied | rebuild with any change, rerun | `AccessDeniedException` from KMS |
-| 5 | Parent direct call denied | call `DeriveSharedSecret` from the parent with no `Recipient` | `AccessDeniedException` |
-| 6 | Recipient behaviour | inspect a `DeriveSharedSecret` response | `SharedSecret` **empty**, `CiphertextForRecipient` present |
-| 7 | Wrong recipient key refused | replay a `CiphertextForRecipient` into a later operation | CMS open refused |
-| 8 | Archive walk | one approval, iterate every sealed row | only the approved record opens |
-| 9 | No TCP listener | `ss -ltnp` inside the parent; try `--transport http` while attested | no listener; server exits 4 |
-| 10 | Scope-token oracle closed | ask the custodian for `index` with the disclosure credential | refused; `search-token` answers only for an approved scope |
-| 11 | vsock `/open` succeeds | the end-to-end disclosure in gate 3 | success over AF_VSOCK |
-| 12 | Registry rollback refused | restore an older registry file, restart | custodian exits 3 |
+| 1 | Known-good enclave + valid authorization | **OPEN** | AWS |
+| 2 | Parent calls `DeriveSharedSecret` directly | **AWS DENY** | **AWS only** |
+| 3 | Parent supplies no `Recipient` | **AWS DENY** | **AWS only** |
+| 4 | Modified EIF | **AWS DENY** | **AWS only** |
+| 5 | Valid enclave, wrong PCR configured in policy | **AWS DENY** | **AWS only** |
+| 6 | Valid attested operation | `CiphertextForRecipient` populated, `SharedSecret` **empty** | **AWS only** |
+| 7 | Ciphertext delivered to the wrong per-operation RSA key | **REFUSE** | local + AWS |
+| 8 | One approval against every row | exactly one authorized row | local + AWS |
+| 9 | `/index` enumeration from the disclosure side | zero useful tokens | local + AWS |
+| 10 | Forged approval to `search-token` | zero tokens | local + AWS |
+| 11 | Replay presence / approval | **REFUSE** | local + AWS |
+| 12 | Cap race | never exceeds remaining uses | local + AWS |
 
-Gates 7, 8, 10 and 12 have equivalents in the local suite
-(`tests/test_custodian.py`, `test_custodian_process.py`, `test_index_oracle.py`)
-that pass against a stand-in implementing the documented KMS semantics.
-**Gates 4, 5 and 6 have no local equivalent that means anything** — they are
-assertions about AWS, and only AWS can answer them.
+### Tests 2–6 are the whole point
 
-### Recording the result
+They are the only results that answer the threat-model question this stage
+was opened to settle, and **they have no local equivalent that means
+anything**. `tests/fake_kms.py` implements the documented semantics so the
+JustiKey side is testable; it proves nothing whatever about AWS, because it
+is a program this project wrote to agree with this project.
 
-Keep the output. A gate that passed once, on an EIF whose PCRs you did not
-write down, is a gate you will have to run again and cannot compare against.
+**Record tests 2–6 separately from the 421 local tests.** They are AWS
+evidence. Mixing them into a test-count makes a claim about AWS that a test
+count cannot support, which is the failure mode this whole review has been
+about.
+
+Tests 7–12 have local equivalents that pass
+(`test_custodian.py`, `test_custodian_process.py`, `test_index_oracle.py`,
+`test_transport.py`). Running them again on AWS confirms the deployment
+wired up what the code does, not that the code does it.
+
+### If a gate fails
+
+- **2, 3 or 5 pass when they should deny** → the key policy is not doing what
+  you think. Check for a default policy granting account root (§3), and check
+  the condition landed with `aws kms get-key-policy`.
+- **4 passes when it should deny** → the PCRs in the policy are not this
+  EIF's, or the enclave is in debug mode and reporting zeroes (§2).
+- **6 returns a populated `SharedSecret`** → **stop.** That is not the
+  attested path, and the plaintext secret has reached the parent. The
+  custodian refuses this case (`custodian.py`), but a deployment where it
+  happens is one where the attestation is not being applied at all.
+
+### The evidence record
+
+Keep it. A gate that passed once, against an EIF whose PCRs you did not write
+down, is a gate you will have to run again and cannot compare against.
 
 ```
-date, EIF sha256, PCR0, PCR1, PCR2, key ARN, key policy sha256,
-gate 1..12 pass/fail, operator
+run date, operator
+EIF sha256, launch flags (confirm NOT --debug-mode)
+PCR0, PCR1, PCR2  (and PCR3/PCR8 if pinned)
+KMS key ARN, key policy sha256, SCP present y/n
+test 1..12: pass/fail, CloudTrail event id for 2-6
+local suite: commit, test count, pass/fail
 ```
 
----
+The CloudTrail event id matters for 2–6: it is the independent record that
+the denial came from AWS rather than from anything in this repository.
 
-## 7. Operating it
+## 7. Migrating the production store
 
-**Rotating the enclave image.** New EIF → new PCR0 → update the key policy
-*before* replacing the running enclave, or the new one cannot call KMS.
-Deploy in this order: build, record PCRs, add the new measurement to the
-policy alongside the old, start the new enclave, verify, stop the old one,
-remove the old measurement.
+Only after every gate passes. This sequence has one irreversible step and it
+is deliberately last.
+
+```
+  backup production store
+        ↓
+  verify the backup            restore it elsewhere and open a record
+        ↓
+  v3 integrity checks          record count, chain, credentials, sample opens
+        ↓
+  v3 → v4 ceremony             scripts/seal_store.py reseal-v4 --apply
+        ↓
+  verify                       counts + chain + credentials + sample opens
+        ↓
+  prove the X25519 key opens nothing
+        ↓
+  switch production disclosure to the attested custodian
+        ↓
+  ─────────────  only now  ─────────────
+  destroy the v3 private key
+```
+
+```bash
+# 3. integrity, before touching anything
+python3 scripts/verify_audit.py --db justikey.db
+python3 scripts/seal_store.py reseal-v4 --db justikey.db \
+    --target-public-key "$CUSTODIAN_PUBLIC_HEX"          # dry run: the count
+
+# 4. the reseal
+python3 scripts/seal_store.py reseal-v4 --db justikey.db \
+    --target-public-key "$CUSTODIAN_PUBLIC_HEX" --apply
+
+# 5. verify: the same cases return the same records
+python3 scripts/verify_audit.py --db justikey.db
+```
+
+**Keep the v3 private key available throughout.** The reseal needs it to read
+each record once, and the post-migration verification needs it to prove it no
+longer opens anything. It is the thing that makes the migration recoverable:
+until verification succeeds, an interrupted or wrong reseal is a retry rather
+than a loss.
+
+**Destroying it is a separate decision, taken afterwards.** Not part of the
+conversion, not automated by the ceremony, and not done on the same day
+unless you are certain. `reseal-v4` deliberately does not destroy it: the
+tool did not create that key and has no business ending it.
+
+Rehearse the whole sequence on a **clone** of the production store first. The
+local rehearsal of this ceremony found two bugs that no unit test had caught
+— a missing column on a genuine v3 store, and a configuration precedence
+error — and both surfaced only because the fixture was real rather than
+constructed.
+
+## 8. Operating it
+
+**Rotating the enclave image.** With exact PCR pinning, a new EIF means a new
+PCR0, so the key policy must be updated *before* the new enclave runs or it
+cannot call KMS. Deploy in this order: build, record PCRs, add the new
+measurement to the policy alongside the old, start the new enclave, verify,
+stop the old one, remove the old measurement.
+
+That is four policy edits per rebuild, each of which should be alarming
+(§3) — which is exactly the friction that makes signed EIFs with PCR8 + PCR3
+worth moving to once the acceptance run is behind you. A controlled signer
+then authorises the new image and the key policy does not change at all.
+Until then, expect rebuilds to be deliberate events rather than routine ones,
+and do not paper over that by loosening the policy.
 
 **Rotating the KMS key.** `recipient_key_id` in each envelope names its key
 version, so historical records stay openable by a custodian holding the older
@@ -331,15 +523,21 @@ returns `disclosure_unavailable` rather than degrading.
 
 ---
 
-## 8. What this runbook cannot promise
+## 9. What this runbook cannot promise
 
-Everything above was written against AWS's documented behaviour and the local
-test suite. The parts that depend on AWS actually behaving as documented —
-gates 4, 5 and 6 — have never been executed by this project. `tests/fake_kms.py`
-implements those semantics so the JustiKey side is testable, and proves
-nothing whatever about AWS.
+Everything above was written against AWS's documented behaviour and a local
+test suite of 421 tests. The parts that depend on AWS actually behaving as
+documented — tests 2 through 6 — have never been executed by this project.
+`tests/fake_kms.py` implements those semantics so the JustiKey side is
+testable, and proves nothing whatever about AWS: it is a program this project
+wrote to agree with this project.
 
-Run the gates on a throwaway key and a throwaway archive first. If gate 5 or
-gate 6 does not behave as this document says, **stop** and re-read the
-current AWS documentation before going further: those two gates are the
-difference between a custodian and an expensive proxy.
+Run the suite on a throwaway key and a throwaway archive first. If test 3 or
+test 6 does not behave as this document says, **stop** and re-read the
+current AWS documentation before going further. Those two are the difference
+between a custodian and an expensive proxy.
+
+One more thing this runbook cannot do: it cannot tell you that the
+administration boundary in §3 is enforced in *your* organization. The SCP
+belongs to whoever governs the account, and this document has no way to check
+that it exists. Confirm it, and record the answer in the evidence.

@@ -719,10 +719,20 @@ produces genuine DER so the parser is tested against the real format.
 
 **Deploying it:** [nitro-deployment-runbook.md](docs/nitro-deployment-runbook.md)
 covers the parent instance, the EIF build and its PCR measurements, the KMS
-key policy pinned to `kms:RecipientAttestation:ImageSha384`, vsock-proxy, and
-twelve acceptance gates that must pass before real plate data goes behind it
-— including the three (modified EIF denied, parent direct call denied,
-`SharedSecret` empty) that no local test can answer.
+key policy pinned to `kms:RecipientAttestation:ImageSha384`, vsock-proxy, a
+twelve-test acceptance suite, and the production migration sequence.
+
+Five of those tests — parent calls KMS directly, no `Recipient`, modified
+EIF, wrong PCR, and `SharedSecret` empty on an attested response — **have no
+local equivalent that means anything** and must be recorded as AWS evidence
+separately from the local suite. `tests/fake_kms.py` is a program this
+project wrote to agree with this project.
+
+The runbook is also explicit that the KMS administration boundary is *not*
+in the key policy: `kms:PutKeyPolicy` is a path to future cryptographic
+access, so a principal that can rewrite the policy can grant itself use of
+the key. Making that separation real needs an SCP or equivalent governance
+above the account, plus alarms on policy changes.
 
 **Not built:** the NSM attestation request needs the device; the vsock round
 trip needs a kernel with vsock routing (this one binds listeners but has no
