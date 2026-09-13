@@ -810,24 +810,55 @@ python3 -m unittest discover -s tests -v
 
 ## Known limitations of this prototype
 
-This is intentionally a lab prototype, not a deployable system. It does
-not implement (and a production JustiKey should add):
+This is a lab prototype, not a deployable system. Read
+[docs/threat-model.md](docs/threat-model.md) alongside this list — it states
+what the architecture does and does not defend against, including the
+residuals that survive every control here.
 
-- Encryption at rest for protected records with keys held outside the
-  application database (HSM/KMS/TPM).
-- mTLS or device-identity-based authentication for sensor ingest.
-- Enterprise identity, hardware-backed MFA, FIDO2/WebAuthn, or CAC/PIV in
-  place of the deterministic demo accounts.
-- Cryptographically signed/verified warrant documents.
-- Asymmetric anchor signatures and WORM or transparency-log anchoring (the
-  prototype ships HMAC checkpoints plus an independent witness; see the
-  anchoring section above).
-- Rate limiting and lockout on the login and ingest endpoints. Nothing here
-  throttles password guessing, and a caller with a bad API key can still
-  drive audit writes.
-- Retention policies, legal holds, multi-tenancy, intrusion monitoring, and
-  incident-response tooling.
-- A durable job to prune spent TOTP records and expired sessions; the
-  prototype purges sessions opportunistically at login.
+**Not implemented, and needed before real plate data:**
 
-See the platform description for the full production security roadmap.
+- **Hardware key custody.** Approver keys are wrapped under a password and
+  the disclosure key is a file. Stage 4 puts approver keys on smartcards or
+  WebAuthn and the disclosure key in an HSM. Until then, an application
+  compromised *at the moment an approver signs* can misuse that moment.
+- **Requester proof-of-presence at disclosure.** A live approval is a bearer
+  capability: a compromised application can spend it in the requester's name
+  within its scope, window and remaining count. See threat-model finding 5.
+- **mTLS or device-identity authentication for sensor ingest.** Sensors
+  authenticate with per-source bearer or HMAC credentials, not device
+  identity.
+- **Enterprise identity** — FIDO2/WebAuthn, CAC/PIV, or an IdP — in place of
+  local accounts with TOTP.
+- **Cryptographically signed warrant documents.** The legal authority is a
+  text field an approver attests to; it is not itself verifiable.
+- **Asymmetric anchor signatures and WORM or transparency-log anchoring.**
+  The prototype ships HMAC checkpoints plus an independent witness, so a
+  party holding the anchor key can forge checkpoints.
+- **Ingest rate limiting.** Login throttling exists; the ingest endpoints
+  have none, so a caller with a bad credential can still drive audit writes.
+- **Legal holds, multi-tenancy, intrusion monitoring, and incident-response
+  tooling.**
+- **A durable job to prune spent TOTP records.** Sessions are purged
+  opportunistically at login; `used_totp` rows accumulate.
+
+**Implemented, but read the caveat:**
+
+- **Keys outside the database.** Data, index, anchor and disclosure keys can
+  all be supplied from a secrets manager, and under v3 the disclosure and
+  index keys live in a separate service. The development fallback writes a
+  key file beside the database and says so on stderr every time.
+- **Retention.** `scripts/enforce_retention.py` deletes observations past
+  their window and audits the purge, but nothing schedules it for you.
+- **Login lockout.** Accounts lock after repeated failures and the lockout is
+  audited. It is per-username, so it does not stop password spraying across
+  many accounts.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Two things the licence does not do, stated here because this project is about
+not overclaiming: it grants no warranty, and it is not an assurance that
+running JustiKey satisfies any jurisdiction's requirements for ALPR
+collection, retention, or disclosure. Those are questions for your own
+counsel.

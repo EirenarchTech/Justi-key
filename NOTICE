@@ -1,0 +1,8 @@
+JustiKey
+Copyright 2026 Eirenarch Group
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product depends on the `cryptography` library (https://cryptography.io),
+dual-licensed under Apache-2.0 and BSD-3-Clause. Everything else is Python
+standard library.
