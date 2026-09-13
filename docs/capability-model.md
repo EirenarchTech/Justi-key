@@ -227,6 +227,22 @@ signature, there is no key, so there is no plaintext.
    from registration values obtained by any means. The disclosure key in an
    HSM or KMS that enforces the scope check itself also remains ahead.
 
+5. **Key isolation.** *(designed — [stage-5-key-isolation.md](stage-5-key-isolation.md))*
+   Compromise of the disclosure-service process must not reveal a reusable
+   archive-decryption secret **or provide an unrestricted cryptographic
+   oracle.** The second clause is the hard one: a non-exportable key in an
+   HSM stops the key being stolen and does nothing about a compromised
+   service calling `DeriveSharedSecret` once per row, because raw ECDH *is*
+   the oracle. So the boundary has to be the operation, not the storage — a
+   custodian that independently verifies record identity, approval digest,
+   proof of presence, scope and key version before agreeing to anything.
+
+   Checking the products first, as the design document records, found that
+   the current X25519 envelope is not supported for key agreement by AWS KMS,
+   Google Cloud KMS, Azure Managed HSM or YubiHSM 2. P-256 is universally
+   available; X25519 is not. That decides whether `jk-seal-v4` happens, and
+   it is a deployment question rather than a technical one.
+
 Each stage closed a hole the previous one made visible: stage 2's split made
 it obvious the application still held the index key, stage 3's chokepoint
 made it obvious the disclosure cap lived in the untrusted side, and stage 3

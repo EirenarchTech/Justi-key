@@ -49,8 +49,11 @@ see the future stage below.
 The service holds the disclosure private key in process memory, so
 compromising that process yields a reusable archive-decryption secret. Every
 other control is downstream of that. This is the open finding stage 5
-addresses; see [capability-model.md](capability-model.md) for the objective
-and the attack suite it has to survive.
+addresses; see [stage-5-key-isolation.md](stage-5-key-isolation.md) for the
+objective, the attack suite it has to survive, and the two findings that
+change its design — chiefly that **an HSM alone does not meet the
+objective**, because a compromised service calling raw ECDH once per row
+decrypts the archive whether or not the key can be exported.
 
 
 
