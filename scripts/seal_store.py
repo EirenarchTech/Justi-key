@@ -54,7 +54,7 @@ from datetime import timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from justikey import (approvals, audit, config, crypto_store, db,  # noqa: E402
-                      disclosure, models, sealing, timeutil)
+                      disclosure, kem, models, sealing, timeutil)
 
 MANIFEST_VERSION = 1
 DEFAULT_SAMPLE = 5
@@ -772,7 +772,127 @@ def cmd_destroy(args, conn):
 
 # ---------------------------------------------------------------------------
 
+def cmd_reseal_v4(args, conn):
+    """v3 -> v4: re-wrap every record under the new suite.
+
+    Unlike the v1 -> v3 migration this destroys nothing. The v3 disclosure key
+    stays valid for anything not yet resealed, so the store is openable at
+    every point during the run and a failure costs a retry rather than an
+    archive. That is why there is no destruction step here and no ceremony
+    manifest stage for one.
+
+    What it does change is the recipient: records are re-wrapped to the key
+    the custodian holds, which for AWS KMS is a P-256 agreement key. The old
+    X25519 key opens nothing afterwards and should be destroyed by whatever
+    process holds it -- but not by this tool, which would be destroying a key
+    it did not create.
+    """
+    mode = crypto_store.encryption_mode(conn)
+    if mode != crypto_store.MODE_V3:
+        raise CeremonyError(f"expected a sealed store, found mode {mode!r}")
+    if not sealing.SEALING_AVAILABLE:
+        raise CeremonyError("the 'cryptography' package is required")
+
+    source_kem, source_private = disclosure.load_private_key_material(args.db)
+    if source_private is None:
+        raise CeremonyError(
+            "the current disclosure private key is required to read each record "
+            "once before re-wrapping it")
+    opener = sealing.RecordOpener(source_private, source_kem)
+
+    target_kem = args.target_kem or kem.DEFAULT_KEM
+    if not args.target_public_key:
+        raise CeremonyError(
+            "--target-public-key is required: this is the key records will be "
+            "re-wrapped to, and on AWS it comes from the custodian's KMS key "
+            "rather than from anything this host can generate")
+    sealer = sealing.RecordSealer(args.target_public_key, target_kem)
+    if sealer.key_id == sealing.key_id(
+            sealing.public_from_private(source_private, source_kem), source_kem):
+        raise CeremonyError("the target key is the key records already use")
+
+    stale = conn.execute(
+        "SELECT COUNT(*) c FROM lpr_events WHERE record_ct IS NOT NULL "
+        "AND (seal_kem IS NULL OR seal_kem != ? OR recipient_key_id != ?)",
+        (target_kem, sealer.key_id)).fetchone()["c"]
+    print(f"To reseal: {stale} record(s) -> {target_kem} / {sealer.key_id}")
+    if not args.apply:
+        print("\nDry run. Back up the database, then re-run with --apply.")
+        return
+
+    # Batched so a large archive does not hold one write transaction open for
+    # its whole duration, and so an interruption leaves a store that is part
+    # v3 and part v4 -- which is fine, because both open.
+    batch, done, failures = args.batch or 500, 0, []
+    while True:
+        rows = conn.execute(
+            "SELECT * FROM lpr_events WHERE record_ct IS NOT NULL "
+            "AND (seal_kem IS NULL OR seal_kem != ? OR recipient_key_id != ?) "
+            "LIMIT ?", (target_kem, sealer.key_id, batch)).fetchall()
+        if not rows:
+            break
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for row in rows:
+                envelope = dict(row)
+                try:
+                    fields = opener.open(envelope, row["captured_at"],
+                                         row["camera_id"], row["plate_index"])
+                except sealing.SealingError as exc:
+                    failures.append((row["id"], str(exc)))
+                    continue
+                fresh = sealer.seal(fields, row["captured_at"], row["camera_id"],
+                                    row["plate_index"])
+                conn.execute(
+                    "UPDATE lpr_events SET record_ct=?, wrapped_key=?, ephemeral_pub=?, "
+                    "record_uid=?, seal_version=?, seal_kem=?, recipient_key_id=? "
+                    "WHERE id=?",
+                    (fresh["record_ct"], fresh["wrapped_key"], fresh["ephemeral_pub"],
+                     fresh["record_uid"], fresh["seal_version"], fresh["seal_kem"],
+                     fresh["recipient_key_id"], row["id"]))
+                done += 1
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        print(f"  resealed {done}/{stale}", end="\r", flush=True)
+        if failures:
+            break
+    print()
+
+    if failures:
+        raise CeremonyError(
+            f"{len(failures)} record(s) could not be opened and were left as they "
+            f"were; the store is part v3 and part v4, and both open. First: "
+            f"record {failures[0][0]}: {failures[0][1]}")
+
+    crypto_store.set_meta(conn, "disclosure_public_key", args.target_public_key)
+    crypto_store.set_meta(conn, "disclosure_kem", target_kem)
+    crypto_store.set_meta(conn, "resealed_at", timeutil.now_iso())
+    digest, sealed = store_digest(conn)
+
+    manifest = load_manifest(args.manifest) or {
+        "manifest_version": MANIFEST_VERSION,
+        "ceremony_id": secrets.token_hex(8),
+        "database": os.path.abspath(args.db),
+        "stages": [],
+    }
+    record_step(conn, args.manifest, manifest, "reseal-v4", args.actor, {
+        "from_kem": source_kem, "to_kem": target_kem,
+        "recipient_key_id": sealer.key_id, "resealed": done,
+        "store_digest": digest, "sealed_records": sealed})
+
+    print(f"Resealed {done} record(s) under {target_kem}.")
+    print(f"  recipient key id : {sealer.key_id}")
+    print(f"  store digest     : {digest}")
+    print(f"  manifest         : {args.manifest}")
+    print("\nThe previous disclosure key now opens nothing in this database.")
+    print("Destroy it wherever it lives; this tool does not, because it did not")
+    print("create it.")
+
+
 COMMANDS = {"plan": cmd_plan, "migrate": cmd_migrate, "verify": cmd_verify,
+            "reseal-v4": cmd_reseal_v4,
             "rekey-credentials": cmd_rekey_credentials,
             "destroy-legacy-key": cmd_destroy}
 
@@ -791,6 +911,13 @@ def main():
                         help="records to open back through the disclosure path")
     parser.add_argument("--approver", help="enrolled approver who signs the sample check")
     parser.add_argument("--confirm", help="exact confirmation phrase for destroy-legacy-key")
+    parser.add_argument("--apply", action="store_true",
+                        help="perform the reseal; without it, reseal-v4 is a dry run")
+    parser.add_argument("--target-public-key",
+                        help="hex public key to re-wrap records to (reseal-v4)")
+    parser.add_argument("--target-kem", help="suite of the target key (reseal-v4)")
+    parser.add_argument("--batch", type=int,
+                        help="records per write transaction during reseal-v4")
     args = parser.parse_args()
 
     if not os.path.exists(args.db):
@@ -800,6 +927,11 @@ def main():
 
     conn = db.get_connection(args.db)
     try:
+        # A store written by an older build lacks columns a newer ceremony
+        # reads -- a v3 store has no seal_kem, because there was only one
+        # suite. migrate() is additive and idempotent, so bringing the schema
+        # forward here turns a raw SQLite error into nothing at all.
+        db.migrate(conn)
         COMMANDS[args.command](args, conn)
     except CeremonyError as exc:
         print(f"\n{exc}", file=sys.stderr)

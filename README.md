@@ -119,7 +119,7 @@ scripts/
   edge_agent.py     device-side recognition with store-and-forward buffering
   encrypt_store.py  migrate a plaintext database to encryption at rest
   enforce_retention.py delete observations past their retention period
-  seal_store.py     the v1 -> v3 migration ceremony, step by step
+  seal_store.py     migration ceremonies: v1 -> v3, and the v3 -> v4 reseal
   manage_keys.py    enrol hardware authenticators; export the service registries
   disclosure_server.py the disclosure service, as its own process and principal
   custodian_server.py  the custodian: verifies the whole context, then agrees once
@@ -384,6 +384,30 @@ with the disclosure key removed : The disclosure service is unavailable, so thes
                                   no partial disclosure occurs.
 key restored                    : Disclosed records (1)
 ```
+
+### Migrating v3 -> v4: re-wrapping to the custodian's key
+
+```bash
+python3 scripts/seal_store.py reseal-v4 --db justikey.db \
+    --target-public-key <hex from the custodian's KMS key>          # dry run
+python3 scripts/seal_store.py reseal-v4 --db justikey.db \
+    --target-public-key <hex> --apply
+```
+
+Unlike the v1 migration this **destroys nothing**. The old disclosure key
+stays valid for anything not yet resealed, so the store is openable at every
+point during the run and an interruption costs a retry rather than an
+archive. Batched, resumable, and a no-op on a second run.
+
+Rehearsed against a 5,013-record store built by the pre-v4 code: three live
+case files returned 3, 3 and 4 records before the reseal and the same 3, 3
+and 4 afterwards; TOTP and sensor secrets untouched; new ingest sealed as v4;
+the old X25519 key opened nothing; the chain verified. Two bugs surfaced
+doing it, both now covered by tests — the ceremony hit a raw SQLite error on
+a v3 store (which has no `seal_kem` column, because there was only one
+suite), and `JUSTIKEY_DISCLOSURE_KEM` was honoured when *reading* a store's
+suite but ignored when *creating* its key, so a store configured as X25519
+got a P-256 key and then read itself as X25519.
 
 ### Migrating v1 -> v3: a ceremony, not a command
 

@@ -623,11 +623,15 @@ def disclosure_kem(conn):
     Asking it is better than defaulting, because a default that disagrees
     with the key holder produces records nobody can open.
     """
-    if config.DISCLOSURE_KEM:
-        return config.DISCLOSURE_KEM
+    # Order matters. What the database recorded wins over configuration: an
+    # environment variable must not be able to reinterpret records that are
+    # already sealed. Configuration chooses only where nothing is recorded
+    # yet, which is a fresh store.
     stored = crypto_store.get_meta(conn, "disclosure_kem")
     if stored:
         return stored
+    if config.DISCLOSURE_KEM:
+        return config.DISCLOSURE_KEM
     if config.DISCLOSURE_URL:
         name = fetch_key_info(config.DISCLOSURE_URL).get("kem")
         if name:
@@ -713,9 +717,14 @@ def public_key_for(conn, db_path, create=False):
     # Creating a key also fixes this database's suite, so record it: a
     # database that cannot say which primitive its records use would have to
     # guess, and guessing is what the suite field exists to prevent.
+    # A fresh store's suite is chosen by configuration; an existing store's is
+    # whatever it recorded. Creating a P-256 key for a store configured as
+    # X25519 -- which this used to do -- produces a database that seals with
+    # one primitive and reads as another.
     existing = crypto_store.get_meta(conn, "disclosure_kem")
     kem_name, private_hex = load_private_key_material(
-        db_path, create=create, kem_name=existing or kem.DEFAULT_KEM)
+        db_path, create=create,
+        kem_name=existing or config.DISCLOSURE_KEM or kem.DEFAULT_KEM)
     if private_hex is None:
         return None
     if not existing:

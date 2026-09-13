@@ -380,6 +380,34 @@ deployment rather than another stand-in. The v3 → v4 reseal is available
 through the existing ceremony but has not been run against a production
 store.
 
+## Migrating an existing store
+
+`scripts/seal_store.py reseal-v4` re-wraps every record from X25519 to the
+custodian's suite. It destroys nothing: the old key stays valid for anything
+not yet resealed, so the store is openable throughout and an interruption
+costs a retry. Batched and resumable; a second run is a no-op.
+
+Rehearsed against a 5,013-record store built by the pre-v4 code at `e975ddd`,
+with real users, sources, a signed sensor credential, and three live case
+files:
+
+```
+before   CASE-2026-000 -> 3 records   CASE-2026-001 -> 3   CASE-2026-002 -> 4
+reseal   5,013 records in 3.0s
+after    CASE-2026-000 -> 3 records   CASE-2026-001 -> 3   CASE-2026-002 -> 4
+         TOTP readable, sensor secret intact, new ingest v4,
+         old X25519 key refused, audit chain verifies
+```
+
+Two bugs surfaced, both fixed and both now tested. The ceremony failed with a
+raw SQLite error on a genuine v3 store, which has no `seal_kem` column
+because there was only one suite — it now brings the schema forward itself.
+And `JUSTIKEY_DISCLOSURE_KEM` was honoured when *reading* a store's suite but
+ignored when *creating* its key, so a store configured as X25519 received a
+P-256 key and then read itself as X25519. Configuration now chooses only for
+a fresh store; what the database recorded always wins, because an
+environment variable must not be able to reinterpret records already sealed.
+
 ## Deploying it
 
 [nitro-deployment-runbook.md](nitro-deployment-runbook.md) is the executable
