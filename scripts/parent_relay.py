@@ -114,6 +114,16 @@ class Handler(servicekit.AuthenticatedHandler, BaseHTTPRequestHandler):
                             {"operation": operation, "detail": str(exc)[:300]})
             self._json(502, {"error": "the custodian is unreachable"})
             return
+        except Exception as exc:  # noqa: BLE001 - see below
+            # Deliberately broad, and only here. An unhandled exception in a
+            # handler thread closes the connection with no reply, which reaches
+            # the appliance as a network error and reaches the operator as
+            # nothing at all. A relay that fails must say so in its own ledger
+            # and answer with a status, not disappear.
+            STATE["record"]("relay_internal_error", "client",
+                            {"operation": operation, "detail": repr(exc)[:300]})
+            self._json(500, {"error": "the relay failed to carry this request"})
+            return
         finally:
             STATE["slots"].release()
 
@@ -127,9 +137,13 @@ def main():
         description="Relay custodian requests from a network into an enclave")
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, default=8443)
-    parser.add_argument("--enclave-cid", type=int, required=True,
+    parser.add_argument("--enclave-cid", type=int,
                         help="the enclave's CID, from nitro-cli describe-enclaves")
     parser.add_argument("--enclave-port", type=int, default=8091)
+    parser.add_argument("--custodian-url",
+                        help="rehearsal: reach the custodian at this URL instead of "
+                             "vsock. Goes through transport.for_url like everything "
+                             "else, so a remote http:// custodian is refused here too")
     parser.add_argument("--appliance-secret",
                         default=os.environ.get("JUSTIKEY_RELAY_APPLIANCE_SECRET"),
                         help="shared secret the appliance's disclosure service signs with")
@@ -137,6 +151,10 @@ def main():
     parser.add_argument("--tls-key", help="PEM private key; defaults to --tls-cert")
     parser.add_argument("--client-ca",
                         help="require a client certificate signed by this CA (mutual TLS)")
+    parser.add_argument("--custodian-secret",
+                        default=os.environ.get("JUSTIKEY_CUSTODIAN_CLIENT_SECRET"),
+                        help="only used with --custodian-url; a vsock custodian "
+                             "authenticates nothing at the transport layer")
     parser.add_argument("--max-connections", type=int, default=32)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--ledger", default="relay-audit.db")
@@ -144,6 +162,14 @@ def main():
 
     if not args.appliance_secret:
         print("Refusing to start: --appliance-secret is required.", file=sys.stderr)
+        return 2
+    if args.custodian_url and not args.custodian_secret:
+        print("Refusing to start: --custodian-url needs --custodian-secret; an "
+              "HTTP transport signs every request.", file=sys.stderr)
+        return 2
+    if not args.custodian_url and args.enclave_cid is None:
+        print("Refusing to start: one of --enclave-cid or --custodian-url is "
+              "required.", file=sys.stderr)
         return 2
 
     local = transport.is_loopback(args.listen_host)
@@ -165,8 +191,14 @@ def main():
     usage = disclosure.UsageStore(args.ledger)
     usage.purge_expired()
 
-    forward = transport.VsockTransport(args.enclave_cid, args.enclave_port,
-                                       args.timeout)
+    if args.custodian_url:
+        forward = transport.for_url(args.custodian_url, "relay",
+                                    args.custodian_secret, args.timeout)
+        destination = args.custodian_url
+    else:
+        forward = transport.VsockTransport(args.enclave_cid, args.enclave_port,
+                                           args.timeout)
+        destination = f"vsock cid={args.enclave_cid} port={args.enclave_port}"
     STATE.update({
         "client_secrets": {"disclosure": args.appliance_secret},
         "usage": usage,
@@ -189,8 +221,7 @@ def main():
 
     where = f"{scheme}://{args.listen_host}:{args.listen_port}"
     print(f"JustiKey ingress relay on {where}")
-    print(f"  to the enclave at vsock cid={args.enclave_cid} "
-          f"port={args.enclave_port}")
+    print(f"  to the custodian at {destination}")
     print(f"  carrying {', '.join(RELAY_OPERATIONS)} (not 'index')")
     if args.client_ca:
         print("  mutual TLS: a client certificate is required")
@@ -199,7 +230,7 @@ def main():
     print("  TLS terminates here, on the parent. This process sees every record")
     print("  it relays back. See the module docstring.")
     record("relay_started", "relay", {
-        "listen": where, "cid": args.enclave_cid, "port": args.enclave_port,
+        "listen": where, "destination": destination,
         "mutual_tls": bool(args.client_ca), "operations": list(RELAY_OPERATIONS)})
 
     try:

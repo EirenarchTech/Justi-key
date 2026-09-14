@@ -714,6 +714,89 @@ evidence in this project that the archive-walking oracle is blocked by a
 boundary outside JustiKey itself. Everything before it is this repository
 agreeing with this repository.
 
+## 6b. The remote-path acceptance suite
+
+Section 6 asks whether AWS enforces the attestation boundary. It says nothing
+about the topology the prototype actually deploys: an on-premises appliance
+reaching the custodian through a relay on the parent. That path has its own
+properties, and they are the gate on promoting `parent_relay.py` and the
+hardened transport out of the feature branch.
+
+```bash
+python3 scripts/remote_acceptance.py \
+  --url https://parent.example:8443 \
+  --client-secret "$APPLIANCE_SECRET" \
+  --tls-ca /etc/justikey/relay-ca.pem \
+  --tls-pin "$RELAY_SPKI_PIN" \
+  --client-cert /etc/justikey/appliance.pem \
+  --client-key /etc/justikey/appliance.key \
+  --evidence remote-acceptance.json
+```
+
+Run it **from the appliance**, not from the parent: the host it runs on is
+part of what it is testing. It exits non-zero on any FAIL.
+
+| # | Property | Proved by |
+|---|---|---|
+| R1 | Appliance → TLS relay → vsock → enclave answers | the script |
+| R2 | The relay reached the enclave over vsock, not a URL | operator: relay ledger startup record |
+| R3 | The enclave reached KMS in the expected Region | operator: CloudTrail |
+| R4 | `search-token` and `publickey` are carried | the script |
+| R5 | `index` is refused at the relay | the script |
+| R6 | `index` never reached the enclave | operator: custodian ledger has no such event |
+| R7 | An oversized request fails at the parent | the script |
+| R8 | Capacity exhaustion refuses rather than queues | the script |
+| R9 | A remote `http://` custodian is impossible | the script |
+| R10a | A wrong pin refuses before sending | the script |
+| R10b | A right pin over an untrusted chain still fails | the script |
+| R10c | The pinned refusal sent no request body | operator: no canary in the relay ledger |
+| R11 | An approved disclosure returns to the appliance | operator: a real disclosure |
+| R12 | Mutual TLS is enforced | the script |
+| R13 | A wrong client secret is refused | the script |
+| R14 | Audit behaviour is unchanged through the remote path | operator: `verify_audit.py` on both ledgers |
+
+### The five rows a client cannot prove about itself
+
+R2, R3, R6, R11 and R14 are `OBSERVE`, and the script prints them as work
+rather than as green rows. That is deliberate. A client can prove what it
+sent and what came back; it cannot prove what did **not** happen inside the
+enclave, and a suite that marked R6 green because the relay returned 404
+would be asserting the interesting half from the boring half.
+
+R5 and R6 are the pair to read together. R5 says the relay refused `index`.
+R6 says the enclave never saw it. Only the second one is the attack-13
+property, and only the custodian's own ledger can answer it.
+
+### R9 on a loopback relay proves nothing
+
+Plain HTTP to a loopback address is allowed on purpose — nothing crosses a
+wire — so R9 reports `INCONCLUSIVE` rather than `PASS` when the relay is
+addressed as `localhost`. Run it against the real hostname. (The property
+itself is covered by `tests/test_remote_transport.py`; R9 is checking this
+deployment's configuration, not the code.)
+
+### Rehearsed, before the day
+
+`tests/test_remote_acceptance.py` runs this entire suite — script, TLS,
+mutual TLS, pinning, the relay, its allowlist, its limits — against a stub
+custodian on loopback, so that a failure on AWS is evidence about AWS rather
+than a bug in the harness. Rehearsing it found three defects: the relay
+crashed in its handler thread when given no custodian secret, an unhandled
+exception dropped the connection instead of answering, and R9 reported a
+failure that was really a loopback address.
+
+The stub proves nothing about Nitro, KMS or attestation. It is a program this
+project wrote to answer the relay.
+
+### Promotion
+
+`main` stays at the documentation baseline until this suite runs clean
+against the real path: every scripted row PASS, every OBSERVE row recorded
+with what was seen. Unit and security tests passed first, real integration
+second, and only then does the implementation enter the mainline. A
+Stage-5-complete tag remains a separate question with its own four
+conditions.
+
 ## 7. Migrating the production store
 
 Only after every gate passes. This sequence has one irreversible step and it

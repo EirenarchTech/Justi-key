@@ -365,6 +365,12 @@ class HttpTransport:
                 "record is returned over this connection. Use https://, or "
                 "vsock:// when the custodian is an enclave on this host.")
 
+        if not client_secret:
+            raise TransportError(
+                f"no client secret for the custodian at {self.host!r}; an HTTP "
+                "transport signs every request, so this fails now rather than "
+                "inside the first handler thread that tries")
+
         self.tls = tls if tls is not None else TlsPolicy.from_config()
         if self.scheme == "http" and self.tls.configured:
             raise TransportError(
