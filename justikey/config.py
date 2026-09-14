@@ -87,6 +87,13 @@ CUSTODIAN_URL = os.environ.get("JUSTIKEY_CUSTODIAN_URL") or None
 CUSTODIAN_CLIENT_ID = os.environ.get("JUSTIKEY_CUSTODIAN_CLIENT_ID", "disclosure-service")
 CUSTODIAN_CLIENT_SECRET = os.environ.get("JUSTIKEY_CUSTODIAN_CLIENT_SECRET") or None
 
+# TLS between a disclosure service and a custodian that is not on this host.
+# All optional; all verified when present. See transport.TlsPolicy.
+CUSTODIAN_TLS_CA = os.environ.get("JUSTIKEY_CUSTODIAN_TLS_CA") or None
+CUSTODIAN_TLS_PIN = os.environ.get("JUSTIKEY_CUSTODIAN_TLS_PIN") or None
+CUSTODIAN_TLS_CLIENT_CERT = os.environ.get("JUSTIKEY_CUSTODIAN_TLS_CLIENT_CERT") or None
+CUSTODIAN_TLS_CLIENT_KEY = os.environ.get("JUSTIKEY_CUSTODIAN_TLS_CLIENT_KEY") or None
+
 # The ingest capability: minting a scope token for an ARBITRARY plate. That is
 # the blind-index key's whole capability, so a host holding this secret AND the
 # sealed archive can map every row without opening one -- measured at 25 of 25

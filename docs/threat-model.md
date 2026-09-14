@@ -347,6 +347,35 @@ enforced in `custodian.KmsAgreement` — a response carrying a populated
 `SharedSecret` alongside a ciphertext is refused outright, because that is
 not the attested path and the plaintext has already reached the parent.
 
+### What a compromised parent still sees, once the appliance is remote
+
+The prototype topology puts ingest, the archive, the audit ledger and the
+disclosure client on an on-premises appliance, and leaves only the custodian
+in the enclave. That is the right split — but it moves the disclosure
+response onto a network, and the relay that carries it (`parent_relay.py`)
+terminates TLS on the parent.
+
+So a parent compromised at time T sees the plaintext of every record
+disclosed after T. It does not see the archive, it cannot enumerate, it
+cannot open a record nobody approved, and it never holds the key. The
+boundary has not moved; the traffic crossing it has become visible.
+
+Three things bound this, and they are worth stating because the temptation is
+to describe the residual as smaller than it is:
+
+| | |
+|---|---|
+| What is exposed | records actually disclosed while the parent is compromised |
+| What is not | the archive, the blind-index key, the agreement key, any record nobody approved |
+| What closes it | TLS terminating inside the enclave, the appliance pinning the enclave's attested key — client side built (`transport.TlsPolicy`), enclave side not |
+
+The relay narrows rather than widens what the parent can ask for: anything on
+the parent can already open a vsock connection to the enclave, and the
+custodian treats every vsock caller as the `disclosure` role, so the relay's
+operation allowlist (no `index`) takes capability away from a compromised
+parent rather than granting it. Its HMAC authentication says which appliance
+is calling. It never says the call is allowed.
+
 ## A cross-cutting principle
 
 Stated separately because it is not about one finding, and because this

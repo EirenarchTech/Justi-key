@@ -341,6 +341,46 @@ attested, and an unattested custodian prints a startup notice saying so.
 Tested as a real subprocess, because an invariant asserted by reading the
 source is an invariant that survives the code being deleted.
 
+### When the appliance is not the parent
+
+The prototype deployment is an on-premises appliance — ingest, archive, audit
+ledger, disclosure client — talking to an enclave in a cloud account. vsock
+does not cross a network, so two things were built.
+
+**`scripts/parent_relay.py`**, a network endpoint on the parent that carries
+`open`, `search-token` and `publickey` into the enclave by name, and refuses
+everything else. `index` is absent deliberately: it mints a scope token for
+an arbitrary plate, and a relay that forwarded whatever path it was handed
+would be one custodian misconfiguration away from re-opening attack 13. It
+parses and re-frames the body, enforces the vsock frame ceiling (1 MiB)
+rather than the HTTP one (8 MiB) so an unusable request dies on the parent,
+bounds concurrency, and refuses to start on a non-loopback listener with no
+certificate.
+
+The relay is not an authorization boundary and takes care not to look like
+one. Anything on the parent can already open a vsock connection to the
+enclave, and the custodian treats every vsock caller as the `disclosure`
+role — the CID is not a credential — so the relay's allowlist takes
+capability away from a compromised parent rather than granting any. Its HMAC
+authentication says which appliance is calling, never that the call is
+allowed.
+
+**Confidentiality that fails closed.** `Custodian.open` returns the opened
+record's fields, so a successful disclosure sends plate data back over the
+wire. `transport.for_url` now refuses `http://` to anything but a loopback
+address, with no override, and `TlsPolicy` adds a private CA, an SPKI pin
+checked before the request body is written, and a client certificate for
+mutual TLS. The pin is over the public key rather than the certificate so
+that renewal does not require reconfiguring every appliance.
+
+What this does not fix: TLS terminates on the parent, so the relay sees the
+plaintext of every record it carries back. The key stays isolated and the
+archive stays unwalkable, but disclosures in flight are visible to a
+compromised parent in a way they were not when everything ran on one host.
+Closing that needs TLS terminating inside the enclave with the appliance
+pinning the enclave's attested key — the client half exists, the enclave half
+does not, and it is the same shape as the configuration bootstrap above.
+
 ### The vsock attacks
 
 | Attack | Result |

@@ -398,31 +398,70 @@ The runbook assumes the disclosure service runs on the parent instance. If it
 runs somewhere else — an on-premises appliance, a separate host — three
 things change, and none of them are covered above:
 
-1. **An ingress forwarder is required.** The enclave speaks only vsock, and
-   vsock does not cross a network. Something on the parent must accept the
-   request and relay it to the enclave's vsock port. It is a few lines, but it
-   is also the process that decides what reaches the custodian, so it is part
-   of the deployment's attack surface and belongs in the threat model rather
-   than in a one-liner.
+1. **An ingress relay is required**, and it is built:
+   `scripts/parent_relay.py`. The enclave speaks only vsock, and vsock does
+   not cross a network, so something on the parent must accept the request and
+   carry the last hop. It is deliberately not a generic TCP-to-vsock pipe: it
+   carries `open`, `search-token` and `publickey` by name and refuses
+   everything else — **`index` above all**, the operation that mints a scope
+   token for an arbitrary plate — parses and re-frames the body so malformed
+   or oversized requests die on the parent, and bounds concurrency because an
+   enclave has a fixed memory allocation.
 
-2. **The response carries plaintext.** `Custodian.open` returns the opened
-   record's `fields`. Between the parent and a remote disclosure service that
-   is plate data in transit. `HttpTransport` accepts an `https://` URL and
-   urllib verifies certificates by default, so TLS is available — but nothing
-   in the code *requires* it, and a plain `http://` URL to a remote host is
-   accepted silently. On any deployment where the custodian is not local,
-   treat an `http://` custodian URL as a misconfiguration.
+   ```bash
+   python3 scripts/parent_relay.py \
+     --enclave-cid "$CID" --enclave-port 8091 \
+     --listen-host 0.0.0.0 --listen-port 8443 \
+     --tls-cert /etc/justikey/relay.pem \
+     --client-ca /etc/justikey/appliance-ca.pem \
+     --appliance-secret "$APPLIANCE_SECRET"
+   ```
+
+   It refuses to start (exit 6) on a non-loopback listener with no
+   certificate, and (exit 7) if asked for mutual TLS without a server
+   certificate.
+
+2. **The response carries plaintext, and the transport now fails closed.**
+   `Custodian.open` returns the opened record's `fields`. `http://` to
+   anything but a loopback address is refused in `transport.for_url`, with no
+   override — a deployment that cannot present a certificate is one that is
+   not ready to carry disclosures. `TlsPolicy` adds a private CA, an SPKI pin
+   checked *before* the request body is written, and a client certificate for
+   mutual TLS:
+
+   ```
+   JUSTIKEY_CUSTODIAN_TLS_CA           private CA for the relay endpoint
+   JUSTIKEY_CUSTODIAN_TLS_PIN          sha256 of the peer's DER SPKI, hex
+   JUSTIKEY_CUSTODIAN_TLS_CLIENT_CERT  mutual TLS
+   JUSTIKEY_CUSTODIAN_TLS_CLIENT_KEY
+   ```
+
+   The pin is over the public key rather than the certificate so renewal for
+   the same key does not require touching every appliance.
 
 3. **The HMAC client secret becomes a network credential**, not a
-   same-host one. It authenticates the disclosure service to the custodian
-   across whatever sits between them. That does not make the parent trusted —
-   the custodian still verifies the approval, the presence proof and the
-   scope itself — but it does mean the secret needs the handling any
+   same-host one. It authenticates the appliance to the relay across whatever
+   sits between them. That does not make the parent or the relay trusted —
+   the custodian still verifies the approval, the presence proof, the scope
+   and the nonce state itself — but the secret now needs the handling any
    internet-facing credential needs.
 
-None of this weakens the Stage-5 property: the key still never leaves the
-enclave, and a compromised parent still cannot walk the archive. It widens
-the surface around the boundary rather than moving it.
+### What this costs, stated plainly
+
+TLS terminates on the parent, which is inside the threat model. **The relay
+therefore sees the plaintext of every record it carries back** — not the
+archive, not the key, but every disclosure that happens while it is
+compromised. On the same-host arrangement that exposure did not exist.
+
+The Stage-5 property is unchanged: the archive-decryption key stays in the
+enclave, and a compromised parent still cannot walk the archive. What the
+remote topology adds is exposure of disclosures *in flight*.
+
+Closing it needs TLS terminating **inside** the enclave, with the appliance
+pinning the enclave's attested key instead of a certificate authority, so the
+relay forwards bytes it cannot read. The client half of that exists
+(`TlsPolicy`'s pin); the enclave half does not. It is the same shape as the
+configuration bootstrap in §5 and should be built with it.
 
 ---
 
