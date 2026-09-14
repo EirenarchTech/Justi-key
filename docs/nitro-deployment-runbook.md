@@ -368,16 +368,61 @@ The enclave has no network. The proxy on the parent forwards its KMS traffic.
 ```bash
 sudo tee /etc/nitro_enclaves/vsock-proxy.yaml >/dev/null <<'YAML'
 allowlist:
-- {address: kms.us-east-1.amazonaws.com, port: 443}
+- {address: kms.${AWS_REGION}.amazonaws.com, port: 443}
 YAML
 
-vsock-proxy 8000 kms.us-east-1.amazonaws.com 443 \
+vsock-proxy 8000 "kms.${AWS_REGION}.amazonaws.com" 443 \
   --config /etc/nitro_enclaves/vsock-proxy.yaml &
 ```
 
 The proxy listens on the parent (CID 3) at port 8000; the enclave connects
 there. Keep the allowlist to exactly the KMS endpoint for your Region — it is
-the enclave's whole view of the internet, and widening it widens that.
+the enclave's whole view of the internet, and widening it widens that. The
+Region must be the one the key was created in; a mismatch here fails as a
+connection error at gate 1 and looks nothing like a Region problem. (An
+earlier draft of this file hardcoded `us-east-1`.)
+
+**This proxy is egress only — enclave out to KMS.** Nothing here carries a
+request *in* to the custodian. A disclosure service running on the same
+parent needs no help: it opens a vsock connection to the enclave's CID
+directly (`vsock://<cid>:8091`). A disclosure service running **anywhere
+else** does, and that forwarder — a TCP listener on the parent that relays to
+the enclave's vsock port — is not built and not documented here. See "When
+the disclosure service is not on the parent" below.
+
+---
+
+### When the disclosure service is not on the parent
+
+The runbook assumes the disclosure service runs on the parent instance. If it
+runs somewhere else — an on-premises appliance, a separate host — three
+things change, and none of them are covered above:
+
+1. **An ingress forwarder is required.** The enclave speaks only vsock, and
+   vsock does not cross a network. Something on the parent must accept the
+   request and relay it to the enclave's vsock port. It is a few lines, but it
+   is also the process that decides what reaches the custodian, so it is part
+   of the deployment's attack surface and belongs in the threat model rather
+   than in a one-liner.
+
+2. **The response carries plaintext.** `Custodian.open` returns the opened
+   record's `fields`. Between the parent and a remote disclosure service that
+   is plate data in transit. `HttpTransport` accepts an `https://` URL and
+   urllib verifies certificates by default, so TLS is available — but nothing
+   in the code *requires* it, and a plain `http://` URL to a remote host is
+   accepted silently. On any deployment where the custodian is not local,
+   treat an `http://` custodian URL as a misconfiguration.
+
+3. **The HMAC client secret becomes a network credential**, not a
+   same-host one. It authenticates the disclosure service to the custodian
+   across whatever sits between them. That does not make the parent trusted —
+   the custodian still verifies the approval, the presence proof and the
+   scope itself — but it does mean the secret needs the handling any
+   internet-facing credential needs.
+
+None of this weakens the Stage-5 property: the key still never leaves the
+enclave, and a compromised parent still cannot walk the archive. It widens
+the surface around the boundary rather than moving it.
 
 ---
 
